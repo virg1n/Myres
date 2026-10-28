@@ -1,0 +1,22 @@
+# Paper-scale model (GPT-2-small sized, ~85M non-embedding params), as in the iGSM papers. ~10-14 h on 4 GPUs.
+name: base
+seed: 1234
+disk_limit_gb: 35
+data:
+  op_train: [2, 15]
+  op_rollout: [6, 15]
+  op_test_id: [10, 15]
+  op_test_ood: [16, 20]
+model: {d_model: 768, n_layers: 12, n_heads: 12, d_ff: 2048, dep_dim: 64, max_pos: 2048}
+revision: {window: 64}
+train:
+  batch_size: 64
+  plain_steps: 50000
+  lr: 6.0e-4
+  min_lr: 6.0e-5
+  num_workers: 8
+  save_every: 2000
+  eval_every: 5000
+eval:
+  n_test: 1000
+  batch_size: 128

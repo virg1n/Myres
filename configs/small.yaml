@@ -1,0 +1,58 @@
+# Pilot experiment: small model (~11M non-embedding params), 4 GPUs, ~1.5-2.5 h end to end.
+name: small
+seed: 1234
+disk_limit_gb: 35          # the run directory is never allowed to grow beyond this
+
+data:
+  op_train: [2, 15]        # iGSM-med style: up to 15 operations in training
+  op_rollout: [6, 15]      # rollouts on the harder half -> more of the model's own mistakes
+  op_test_id: [10, 15]     # in-distribution test
+  op_test_ood: [16, 20]    # out-of-distribution: more operations than seen in training
+  gen: {n_layers: 4, items_per_layer: [2, 4], max_instance_params: 20, abs_depth: 2}
+
+model: {d_model: 384, n_layers: 6, n_heads: 6, d_ff: 1024, dep_dim: 64, max_pos: 2048}
+
+revision:
+  window: 64               # tokens (~3 solution lines) that can be re-read and fixed
+  slack: 4                 # extra masks for long erased runs (filled with <null> if not needed)
+  slack_min_len: 3
+  identity_w: 0.2          # weight of "this token is fine" targets of the fix head
+  mask_patterns: [0.5, 0.2, 0.15, 0.15]   # masked gaps: dependency-shaped, span, line, random
+  dep_target: confdrop     # confdrop (measured confidence drop) | oracle (generator graph)
+  confdrop_delta: 2.0      # dependent if log-prob drops by > delta nats after the fix
+  confdrop_iters: 4
+
+train:
+  batch_size: 64           # sequences per GPU per step
+  plain_steps: 20000       # defines the compute budget shared by both models
+  branch_frac: 0.5         # revision model starts from the plain model at 50% of the budget
+  lr: 1.0e-3
+  min_lr: 1.0e-4
+  warmup_frac: 0.02
+  rewarmup_steps: 200
+  windows_per_seq: 2
+  masked_window_prob: 0.5
+  self_error_frac: 0.4     # share of each batch made of the model's own erroneous solutions
+  dep_warmup_steps: 300
+  rollout_every: 50
+  rollout_problems: 256
+  rollout_batch: 256
+  rollout_temps: [0.0, 0.7, 1.0]
+  rollout_max_new: 600
+  buffer_size: 30000
+  min_buffer: 512
+  num_workers: 8           # CPU workers per GPU generating problems (48 cores / 4 GPUs)
+  log_every: 50
+  save_every: 1000
+  eval_every: 2000
+  eval_n: 256
+  amp: bf16
+
+eval:
+  n_test: 1000
+  batch_size: 128
+  plain_batch_size: 256
+  policy: {tau_err: 0.5, tau_dep: 0.5, max_fixes: 8, check_every: 1, max_sol_len: 600, diagnostics: true}
+  sweep_max_fixes: []      # e.g. [1, 2, 4, 16] for accuracy-vs-compute curves (adds ~1 h)
+  majority_k: auto         # plain model + majority vote at the FLOPs of variant 4
+  majority_k_max: 32

@@ -26,29 +26,29 @@ fi
 [[ "$NGPU" -lt 1 ]] && NGPU=1
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
 export PYTHONUNBUFFERED=1
+PY="${PYTHON:-$(command -v python || command -v python3)}"
 
-NAME=$(python -c "import sys; from revise.utils import load_config; print(load_config(sys.argv[1], sys.argv[2:])['out_dir'])" "$CONFIG" "${OVERRIDES[@]}")
+NAME=$("$PY" -c "import sys; from revise.utils import load_config; print(load_config(sys.argv[1], sys.argv[2:])['out_dir'])" "$CONFIG" ${OVERRIDES[@]+"${OVERRIDES[@]}"})
 mkdir -p "$NAME"
 LOG="$NAME/run_all.log"
 echo "config=$CONFIG  gpus=$NGPU  out=$NAME  log=$LOG"
 
-
 launch() {
   if [[ "$NGPU" -gt 1 ]]; then
-    torchrun --standalone --nproc_per_node="$NGPU" -m "$@"
+    "$PY" -m torch.distributed.run --standalone --nproc_per_node="$NGPU" -m "$@"
   else
-    python -m "$@"
+    "$PY" -m "$@"
   fi
 }
 
 {
   echo "=== [1/4] plain model ($(date)) ==="
-  launch revise.train --config "$CONFIG" --stage plain "${OVERRIDES[@]}"
+  launch revise.train --config "$CONFIG" --stage plain ${OVERRIDES[@]+"${OVERRIDES[@]}"}
   echo "=== [2/4] revision model ($(date)) ==="
-  launch revise.train --config "$CONFIG" --stage revise "${OVERRIDES[@]}"
+  launch revise.train --config "$CONFIG" --stage revise ${OVERRIDES[@]+"${OVERRIDES[@]}"}
   echo "=== [3/4] evaluation ($(date)) ==="
-  launch revise.evaluate --config "$CONFIG" "${OVERRIDES[@]}"
+  launch revise.evaluate --config "$CONFIG" ${OVERRIDES[@]+"${OVERRIDES[@]}"}
   echo "=== [4/4] report ($(date)) ==="
-  python -m revise.report --config "$CONFIG" "${OVERRIDES[@]}"
+  "$PY" -m revise.report --config "$CONFIG" ${OVERRIDES[@]+"${OVERRIDES[@]}"}
   echo "done ($(date)). Results: $NAME/results/results.md"
 } 2>&1 | tee -a "$LOG"

@@ -43,6 +43,7 @@ class Policy:
     check_every: int = 1
     confdrop_delta: float = 2.0
     confdrop_iters: int = 4
+    require_disagree: bool = True  # fix only where the fix head prefers another token
     max_sol_len: int = 600
     diagnostics: bool = True
 
@@ -152,8 +153,10 @@ class Runner:
             out["logp_tok"] = torch.log_softmax(fl, -1).gather(-1, ctok.unsqueeze(-1)).squeeze(-1)
             fill = fl.masked_fill(self.no_fill, -1e9)
             out["fill"] = fill.argmax(-1)
-            fx = fl.masked_fill(self.no_fix, -1e9).scatter(-1, ctok.unsqueeze(-1), -1e9)
-            out["fix"] = fx.argmax(-1)
+            fx = fl.masked_fill(self.no_fix, -1e9)
+            cur = fl.gather(-1, ctok.unsqueeze(-1))
+            out["disagree"] = fx.scatter(-1, ctok.unsqueeze(-1), cur).argmax(-1) != ctok
+            out["fix"] = fx.scatter(-1, ctok.unsqueeze(-1), -1e9).argmax(-1)
         return out
 
     @torch.no_grad()
@@ -203,7 +206,9 @@ def decode_revision(model, problems, policy: Policy, tok, device, batch_size=64,
         if has_copy:
             err = out["err"].masked_fill(~out["cvalid"], 0.0)
             ctok = out["ctok"]
-            bad = (ctok == MASK) | (ctok == EOS) | (ctok == NULL)
+            bad = (ctok == MASK) | (ctok == NULL)
+            if policy.require_disagree:
+                bad = bad | ~out["disagree"]
             err = err.masked_fill(bad, 0.0)
             err_max, err_arg = err.max(-1)
             err_max, err_arg = err_max.tolist(), err_arg.tolist()

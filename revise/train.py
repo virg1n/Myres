@@ -23,7 +23,7 @@ import torch
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from .decode import decode_plain
+from .decode import decode_plain, decode_revision, make_policy
 from .examples import collate, error_example
 from .data import make_loader
 from .igsm.generator import GenConfig, ProblemSampler, make_test_set
@@ -144,47 +144,39 @@ def confdrop_targets(m, h, batch, cfg, amp, mask_id):
         return 0
     r_cfg = cfg["revision"]
     delta, iters = r_cfg["confdrop_delta"], r_cfg["confdrop_iters"]
-    idx = torch.tensor([b for (_, b, _, _, _, _) in rows], device=batch["ids"].device)
-    sub = {k: batch[k][idx] for k in ("ids", "pos", "is_copy", "wstart", "wid", "valid")}
-    R = len(rows)
+    dev = batch["ids"].device
+    row_i, rb, off, n, j, ft = (torch.tensor(c, device=dev) for c in zip(*rows))
+    R, Wm = len(rows), int(n.max())
+    sub = {k: batch[k][rb] for k in ("ids", "pos", "is_copy", "wstart", "wid", "valid")}
+    kk = torch.arange(Wm, device=dev)
+    in_win = kk[None] < n[:, None]
+    pidx = torch.where(in_win, off[:, None] + kk[None], torch.zeros_like(kk)[None])
+    later = in_win & (kk[None] > j[:, None])
+    rr = torch.arange(R, device=dev)[:, None].expand(R, Wm)
 
-    def logp_written(hh, ids, rowsel):
-        out = []
-        for r, (_, b, off, n, j, ft) in enumerate(rows):
-            x = hh[rowsel[r], off:off + n].float()
-            lp = torch.log_softmax(m.fix_logits(x).float(), -1)
-            out.append(lp.gather(-1, ids[rowsel[r], off:off + n].unsqueeze(-1)).squeeze(-1))
-        return out
+    def logp_written(hh, ids, sel):
+        x = hh[sel[:, None], pidx]
+        lp = torch.log_softmax(m.fix_logits(x).float(), -1)
+        return lp.gather(-1, ids[sel[:, None], pidx].unsqueeze(-1)).squeeze(-1)
 
     # "before" comes from the training forward pass (same weights, no extra cost)
-    before = logp_written(h.detach(), batch["ids"], [b for (_, b, _, _, _, _) in rows])
+    before = logp_written(h.detach(), batch["ids"], rb)
     ids = sub["ids"].clone()
-    for r, (_, b, off, n, j, ft) in enumerate(rows):
-        ids[r, off + j] = ft
-    dep = [set() for _ in rows]
-    active = list(range(R))
+    ids[torch.arange(R, device=dev), off + j] = ft
+    dep = torch.zeros(R, Wm, dtype=torch.bool, device=dev)
+    active = torch.ones(R, dtype=torch.bool, device=dev)
     processed = 0
     for it in range(iters):
         processed += int(sub["valid"].sum())
-        after = logp_written(forward_batch(m, {**sub, "ids": ids}, amp), ids, list(range(R)))
-        nxt = []
-        for r in active:
-            _, b, off, n, j, ft = rows[r]
-            drop = (before[r] - after[r]).tolist()
-            new = [k for k in range(j + 1, n) if k not in dep[r] and drop[k] > delta]
-            if new:
-                dep[r].update(new)
-                for k in new:
-                    ids[r, off + k] = mask_id
-                nxt.append(r)
-        active = nxt
-        if not active:
+        after = logp_written(forward_batch(m, {**sub, "ids": ids}, amp), ids, torch.arange(R, device=dev))
+        new = later & ~dep & ((before - after) > delta) & active[:, None]
+        if not bool(new.any()):
             break
-    for r, (row, b, off, n, j, ft) in enumerate(rows):
-        tgt = torch.full((n,), -1, dtype=torch.long)
-        for k in range(j + 1, n):
-            tgt[k] = 1 if k in dep[r] else 0
-        batch["dep_t"][row, :n] = tgt.to(batch["dep_t"].device)
+        dep |= new
+        active = new.any(1)
+        ids[rr[new], pidx[new]] = mask_id
+    tgt = torch.where(later, dep.long(), torch.full_like(dep, -1, dtype=torch.long))
+    batch["dep_t"][row_i, :Wm] = tgt
     return processed
 
 
@@ -351,7 +343,18 @@ def main():
         if step % t["eval_every"] == 0 and rank == 0:
             res = decode_plain(raw, eval_set, tok, device, batch_size=t["rollout_batch"], amp_dtype=amp,
                                max_sol_len=t["rollout_max_new"])
-            log.log({"stage": args.stage, "step": step, "eval_greedy_acc": sum(r["correct"] for r in res) / len(res)})
+            rec = {"stage": args.stage, "step": step, "eval_greedy_acc": sum(r["correct"] for r in res) / len(res)}
+            if args.stage == "revise" and t.get("eval_revision_n", 0):
+                pol = make_policy("dep_head", {**cfg["eval"]["policy"], "window": cfg["revision"]["window"],
+                                               "slack": cfg["revision"]["slack"], "diagnostics": True})
+                rr = decode_revision(raw, eval_set[: t["eval_revision_n"]], pol, tok, device,
+                                     batch_size=cfg["eval"]["batch_size"], amp_dtype=amp)
+                ev = [e for r in rr for e in r["events"]]
+                rec.update({"eval_dep_head_acc": sum(r["correct"] for r in rr) / len(rr),
+                            "eval_same_problems_greedy_acc": sum(r["correct"] for r in res[: len(rr)]) / len(rr),
+                            "eval_fixes_per_problem": len(ev) / len(rr),
+                            "eval_fix_precision": sum(e["true_err"] for e in ev) / max(1, len(ev))})
+            log.log(rec)
             raw.train()
 
         if step % t["save_every"] == 0 and rank == 0:

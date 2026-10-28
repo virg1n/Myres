@@ -15,6 +15,7 @@ any number of *window copies*. Three kinds of windows are produced:
 
 import random
 
+import numpy as np
 import torch
 
 from .igsm.checker import ERR, OK, descendants
@@ -214,70 +215,75 @@ def collate(examples, pad_id, max_set=64):
     B = len(examples)
     lens = [len(e["ids"]) + sum(len(w["ids"]) for w in e["windows"]) for e in examples]
     L = max(lens)
-    ids = torch.full((B, L), pad_id, dtype=torch.long)
-    pos = torch.zeros((B, L), dtype=torch.long)
-    is_copy = torch.zeros((B, L), dtype=torch.bool)
-    wstart = torch.zeros((B, L), dtype=torch.long)
-    wid = torch.full((B, L), -1, dtype=torch.long)
-    valid = torch.zeros((B, L), dtype=torch.bool)
-    lm_tgt = torch.full((B, L), IGNORE, dtype=torch.long)
-    err_tgt = torch.full((B, L), -1, dtype=torch.long)
+    ids = np.full((B, L), pad_id, dtype=np.int64)
+    pos = np.zeros((B, L), dtype=np.int64)
+    is_copy = np.zeros((B, L), dtype=bool)
+    wstart = np.zeros((B, L), dtype=np.int64)
+    wid = np.full((B, L), -1, dtype=np.int64)
+    valid = np.zeros((B, L), dtype=bool)
+    lm_tgt = np.full((B, L), IGNORE, dtype=np.int64)
+    err_tgt = np.full((B, L), -1, dtype=np.int64)
     fix_pos, fix_sets, fix_w = [], [], []
     dep_q, dep_k, dep_t = [], [], []
     confdrop = []  # (row index in dep arrays, b, copy offset, copy len, j, fix_tok)
     for b, e in enumerate(examples):
         n = len(e["ids"])
-        ids[b, :n] = torch.tensor(e["ids"])
-        pos[b, :n] = torch.arange(n)
+        ids[b, :n] = e["ids"]
+        pos[b, :n] = np.arange(n)
         valid[b, :n] = True
-        lm_tgt[b, :n] = torch.tensor(e["lm_tgt"])
+        lm_tgt[b, :n] = e["lm_tgt"]
         off = n
         for wi, w in enumerate(e["windows"]):
             m = len(w["ids"])
             if m == 0:
                 continue
-            sl = slice(off, off + m)
-            ids[b, sl] = torch.tensor(w["ids"])
-            pos[b, sl] = torch.arange(w["start"], w["start"] + m)
-            is_copy[b, sl] = True
-            wstart[b, sl] = w["start"]
-            wid[b, sl] = wi
-            valid[b, sl] = True
-            err_tgt[b, sl] = torch.tensor(w["err"])
-            for i in range(m):
-                s = w["fix"][i]
-                if w["fix_w"][i] > 0 and s:
-                    fix_pos.append(b * L + off + i)
-                    fix_sets.append(s[:max_set])
-                    fix_w.append(w["fix_w"][i])
+            ids[b, off:off + m] = w["ids"]
+            pos[b, off:off + m] = np.arange(w["start"], w["start"] + m)
+            is_copy[b, off:off + m] = True
+            wstart[b, off:off + m] = w["start"]
+            wid[b, off:off + m] = wi
+            valid[b, off:off + m] = True
+            err_tgt[b, off:off + m] = w["err"]
+            base = b * L + off
+            for i, (fs, fw) in enumerate(zip(w["fix"], w["fix_w"])):
+                if fw > 0 and fs:
+                    fix_pos.append(base + i)
+                    fix_sets.append(fs)
+                    fix_w.append(fw)
             if w.get("dep_row", -1) >= 0 and w.get("dep_tgt") is not None:
                 r = len(dep_q)
-                dep_q.append(b * L + off + w["dep_row"])
-                dep_k.append([b * L + off + i for i in range(m)])
-                dep_t.append(list(w["dep_tgt"]))
+                dep_q.append(base + w["dep_row"])
+                dep_k.append((base, m))
+                dep_t.append(w["dep_tgt"])
                 if w.get("confdrop") is not None:
                     confdrop.append((r, b, off, m, w["dep_row"], w["confdrop"]["fix_tok"]))
             off += m
 
-    batch = {"ids": ids, "pos": pos, "is_copy": is_copy, "wstart": wstart, "wid": wid,
-             "valid": valid, "lm_tgt": lm_tgt, "err_tgt": err_tgt,
+    T = torch.from_numpy
+    batch = {"ids": T(ids), "pos": T(pos), "is_copy": T(is_copy), "wstart": T(wstart), "wid": T(wid),
+             "valid": T(valid), "lm_tgt": T(lm_tgt), "err_tgt": T(err_tgt),
              "kinds": [e.get("kind", "") for e in examples], "confdrop": confdrop}
-    S = max([len(s) for s in fix_sets] + [1])
-    fs = torch.full((len(fix_sets), S), -1, dtype=torch.long)
-    for i, s in enumerate(fix_sets):
-        fs[i, : len(s)] = torch.tensor(s)
+    S = min(max_set, max([len(x) for x in fix_sets] + [1]))
+    fs = np.full((len(fix_sets), S), -1, dtype=np.int64)
+    single = [i for i, x in enumerate(fix_sets) if len(x) == 1]
+    if single:
+        fs[single, 0] = [fix_sets[i][0] for i in single]
+    for i, x in enumerate(fix_sets):
+        if len(x) > 1:
+            x = x[:S]
+            fs[i, :len(x)] = x
     batch["fix_pos"] = torch.tensor(fix_pos, dtype=torch.long)
-    batch["fix_sets"] = fs
+    batch["fix_sets"] = T(fs)
     batch["fix_w"] = torch.tensor(fix_w, dtype=torch.float)
-    K = max([len(k) for k in dep_k] + [1])
-    dk = torch.full((len(dep_k), K), -1, dtype=torch.long)
-    dt = torch.full((len(dep_k), K), -1, dtype=torch.long)
-    for i, (k, t) in enumerate(zip(dep_k, dep_t)):
-        dk[i, : len(k)] = torch.tensor(k)
-        dt[i, : len(t)] = torch.tensor(t)
+    K = max([m for _, m in dep_k] + [1])
+    dk = np.full((len(dep_k), K), -1, dtype=np.int64)
+    dt = np.full((len(dep_k), K), -1, dtype=np.int64)
+    for i, ((base, m), t) in enumerate(zip(dep_k, dep_t)):
+        dk[i, :m] = np.arange(base, base + m)
+        dt[i, :len(t)] = t
     batch["dep_q"] = torch.tensor(dep_q, dtype=torch.long)
-    batch["dep_k"] = dk
-    batch["dep_t"] = dt
+    batch["dep_k"] = T(dk)
+    batch["dep_t"] = T(dt)
     return batch
 
 

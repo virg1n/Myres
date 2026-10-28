@@ -1,0 +1,5 @@
+torch>=2.2
+numpy
+pyyaml
+matplotlib  # optional, for the plot
+pytest      # optional, for tests

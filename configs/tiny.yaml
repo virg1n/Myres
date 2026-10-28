@@ -1,4 +1,4 @@
-# Smoke test: runs the full pipeline in a few minutes (also works on CPU).
+# Smoke test: whole pipeline in a few minutes on CPU or GPU (numbers are meaningless).
 name: tiny
 data:
   op_train: [2, 6]

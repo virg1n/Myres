@@ -39,7 +39,7 @@ DEFAULTS = {
         "err_pos_weight": 1.0, "dep_warmup_steps": 300,
         "rollout_every": 50, "rollout_problems": 256, "rollout_batch": 256, "rollout_temps": [0.0, 0.7, 1.0],
         "rollout_max_new": 600, "buffer_size": 30000, "min_buffer": 512,
-        "num_workers": 6, "log_every": 50, "save_every": 1000, "eval_every": 2000, "eval_n": 256,
+        "num_workers": 6, "log_every": 50, "save_every": 1000, "eval_every": 2000, "eval_n": 256, "eval_revision_n": 64,
         "amp": "bf16", "compile": False, "max_hours": 1000,
     },
     "eval": {
