@@ -19,8 +19,9 @@ revision:
   identity_w: 0.2          # weight of "this token is fine" targets of the fix head
   mask_patterns: [0.5, 0.2, 0.15, 0.15]   # masked gaps: dependency-shaped, span, line, random
   dep_target: confdrop     # confdrop (measured confidence drop) | oracle (generator graph)
+  confdrop_mode: writer    # confidence = writer's log p(token | text before it)
   confdrop_delta: 2.0      # dependent if log-prob drops by > delta nats after the fix
-  confdrop_iters: 4
+  confdrop_iters: 6        # repeat (with found dependents re-written) to catch indirect dependents
 
 train:
   batch_size: 64           # sequences per GPU per step
@@ -52,7 +53,9 @@ eval:
   n_test: 1000
   batch_size: 128
   plain_batch_size: 256
-  policy: {tau_err: 0.5, tau_dep: 0.5, max_fixes: 8, check_every: 1, max_sol_len: 600, diagnostics: true}
+  calib_n: 256                 # held-out problems for calibrating the error threshold
+  calib_false_per_problem: 0.5 # tau_err: allow this many false fixes per solution
+  policy: {tau_err: auto, tau_dep: 0.5, max_fixes: 8, check_every: 1, max_sol_len: 600, diagnostics: true}
   sweep_max_fixes: []      # e.g. [1, 2, 4, 16] for accuracy-vs-compute curves (adds ~1 h)
   majority_k: auto         # plain model + majority vote at the FLOPs of variant 4
   majority_k_max: 32

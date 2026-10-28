@@ -13,7 +13,7 @@ import time
 import torch
 import torch.distributed as dist
 
-from .decode import VARIANTS, decode_majority, decode_plain, decode_revision, make_policy
+from .decode import VARIANTS, calibrate_tau_err, decode_majority, decode_plain, decode_revision, make_policy
 from .igsm.generator import GenConfig, make_test_set
 from .igsm.tokenizer import Tokenizer
 from .model import ModelConfig, RevisionLM
@@ -74,6 +74,9 @@ def main():
     ap.add_argument("--variants", nargs="*", default=None)
     ap.add_argument("overrides", nargs="*")
     args = ap.parse_args()
+    if args.variants:  # allow key=value overrides after --variants
+        args.overrides += [v for v in args.variants if "=" in v]
+        args.variants = [v for v in args.variants if "=" not in v] or None
     cfg = load_config(args.config, args.overrides)
     rank, world, device = init_dist()
     amp = amp_dtype(cfg) if device.type == "cuda" else None
@@ -89,6 +92,27 @@ def main():
     gcfg = GenConfig.from_dict(cfg["data"]["gen"])
     variants = args.variants or e["variants"]
     max_len = e["policy"]["max_sol_len"]
+
+    calib = None
+    if rev is not None and str(e["policy"].get("tau_err", "auto")) == "auto":
+        cpath = os.path.join(out_dir, "calibration.json")
+        if os.path.exists(cpath):
+            with open(cpath) as f:
+                calib = json.load(f)
+        else:
+            if rank == 0:
+                vprobs = make_test_set(gcfg, cfg["data"]["op_test_id"], e.get("calib_n", 256), cfg["seed"] + 3000017, tok)
+                calib = calibrate_tau_err(rev, vprobs, tok, device, cfg["revision"]["window"], amp,
+                                          e.get("calib_false_per_problem", 0.5),
+                                          max_sol_len=max_len, batch_size=e["batch_size"])
+                with open(cpath, "w") as f:
+                    json.dump(calib, f, indent=2)
+                print(f"calibrated error threshold: {calib}", flush=True)
+            if world > 1:
+                obj = [calib]
+                dist.broadcast_object_list(obj, src=0)
+                calib = obj[0]
+        e["policy"]["tau_err"] = calib["tau_err"]
 
     test_sets = {"id": (cfg["data"]["op_test_id"], cfg["seed"] + 1000003),
                  "ood": (cfg["data"]["op_test_ood"], cfg["seed"] + 2000003)}
@@ -134,7 +158,8 @@ def main():
                                   "slack": cfg["revision"]["slack"],
                                   "slack_min_len": cfg["revision"]["slack_min_len"],
                                   "confdrop_delta": cfg["revision"]["confdrop_delta"],
-                                  "confdrop_iters": cfg["revision"]["confdrop_iters"]})
+                                  "confdrop_iters": cfg["revision"]["confdrop_iters"],
+                                  "confdrop_mode": cfg["revision"].get("confdrop_mode", "writer")})
             res = run(v, lambda: decode_revision(rev, mine, pol, tok, device, e["batch_size"], amp,
                                                  seed=cfg["seed"], n_params=N))
             summary[set_name][v] = summarize(res, plain_flops)
@@ -161,6 +186,8 @@ def main():
             summary[set_name][f"plain_majority@{k}"] = summarize(res, plain_flops)
 
     if rank == 0:
+        if calib is not None:
+            summary["calibration"] = calib
         with open(os.path.join(out_dir, "summary.json"), "w") as f:
             json.dump(summary, f, indent=2)
         from .report import write_report

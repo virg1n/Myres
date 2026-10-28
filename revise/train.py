@@ -23,7 +23,7 @@ import torch
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from .decode import decode_plain, decode_revision, make_policy
+from .decode import calibrate_tau_err, decode_plain, decode_revision, make_policy
 from .examples import collate, error_example
 from .data import make_loader
 from .igsm.generator import GenConfig, ProblemSampler, make_test_set
@@ -133,15 +133,78 @@ def compute_losses(m, h, batch, cfg, step, stage):
 
 @torch.no_grad()
 def confdrop_targets(m, h, batch, cfg, amp, mask_id):
-    """Fill batch['dep_t'] rows marked for confidence-drop measurement.
-
-    before = log p_fix(written token) on the window containing the error;
-    after  = same with the error replaced by its fix and the dependents found
-    so far masked. Tokens after the error whose log-prob drops by more than
-    `delta` are labelled dependent; repeated until no new dependents."""
-    rows = batch["confdrop"]
-    if not rows:
+    """Fill batch['dep_t'] rows marked for confidence-drop measurement:
+    tokens after the error whose confidence drops by more than `delta` nats
+    once the error is fixed are labelled dependent. Returns tokens processed."""
+    if not batch["confdrop"]:
         return 0
+    if cfg["revision"].get("confdrop_mode", "writer") == "writer":
+        return _confdrop_writer(m, h, batch, cfg, amp)
+    return _confdrop_reread(m, h, batch, cfg, amp, mask_id)
+
+
+@torch.no_grad()
+def _confdrop_writer(m, h, batch, cfg, amp):
+    """Confidence = the writer's log p(token | text before it).
+    before: on the model's own text (from the training forward pass, free);
+    after:  with the error replaced by its fix. Dependents found in a pass are
+    replaced by what the model would now write ("virtual repair") and the
+    measurement is repeated, so that indirect dependents -- e.g. the 9 in
+    '= 7 + 2 = 9' after the 7 itself turned out to depend on the fix -- are
+    found as well."""
+    rows = batch["confdrop"]
+    r_cfg = cfg["revision"]
+    delta, iters = r_cfg["confdrop_delta"], r_cfg["confdrop_iters"]
+    dev = batch["ids"].device
+    row_i, rb, off, n, j, ft = (torch.tensor(c, device=dev) for c in zip(*rows))
+    R, Wm = len(rows), int(n.max())
+    sub = {k: batch[k][rb] for k in ("ids", "pos", "is_copy", "wstart", "wid", "valid")}
+    wst = batch["wstart"][rb, off]  # causal position of each window's first token
+    kk = torch.arange(Wm, device=dev)
+    in_win = kk[None] < n[:, None]
+    cpos = torch.where(in_win, wst[:, None] + kk[None], torch.ones_like(kk)[None])
+    later = in_win & (kk[None] > j[:, None])
+    rr = torch.arange(R, device=dev)[:, None].expand(R, Wm)
+    ar = torch.arange(R, device=dev)
+
+    def logp_next(hh, ids, sel):
+        logits = m.lm_logits(hh[sel[:, None], cpos - 1]).float()
+        lp = torch.log_softmax(logits, -1).gather(-1, ids[sel[:, None], cpos].unsqueeze(-1)).squeeze(-1)
+        return lp, logits.argmax(-1)
+
+    before, _ = logp_next(h.detach(), batch["ids"], rb)
+    ids = sub["ids"].clone()
+    ids[ar, wst + j] = ft
+    dep = torch.zeros(R, Wm, dtype=torch.bool, device=dev)
+    active = torch.ones(R, dtype=torch.bool, device=dev)
+    processed = 0
+    for it in range(iters):
+        act = active.nonzero().squeeze(1)  # only rows that still found new dependents
+        part = {k: v[act] for k, v in sub.items()}
+        part["ids"] = ids[act]
+        processed += int(part["valid"].sum())
+        hh = forward_batch(m, part, amp)
+        after = torch.full_like(before, float("inf"))
+        pred = torch.zeros_like(ids[:, :Wm])
+        logits = m.lm_logits(hh[torch.arange(len(act), device=dev)[:, None], cpos[act] - 1]).float()
+        after[act] = torch.log_softmax(logits, -1).gather(-1, ids[act[:, None], cpos[act]].unsqueeze(-1)).squeeze(-1)
+        pred[act] = logits.argmax(-1)
+        new = later & ~dep & ((before - after) > delta) & active[:, None]
+        if not bool(new.any()):
+            break
+        dep |= new
+        active = new.any(1)
+        ids[rr[new], cpos[new]] = pred[new]
+    tgt = torch.where(later, dep.long(), torch.full_like(dep, -1, dtype=torch.long))
+    batch["dep_t"][row_i, :Wm] = tgt
+    return processed
+
+
+@torch.no_grad()
+def _confdrop_reread(m, h, batch, cfg, amp, mask_id):
+    """Alternative: confidence = re-read fix head's log p(written token);
+    dependents found so far are masked between passes."""
+    rows = batch["confdrop"]
     r_cfg = cfg["revision"]
     delta, iters = r_cfg["confdrop_delta"], r_cfg["confdrop_iters"]
     dev = batch["ids"].device
@@ -345,10 +408,16 @@ def main():
                                max_sol_len=t["rollout_max_new"])
             rec = {"stage": args.stage, "step": step, "eval_greedy_acc": sum(r["correct"] for r in res) / len(res)}
             if args.stage == "revise" and t.get("eval_revision_n", 0):
+                nr = min(t["eval_revision_n"], len(eval_set) // 2)
+                cal = calibrate_tau_err(raw, eval_set[-nr:], tok, device, cfg["revision"]["window"], amp,
+                                        cfg["eval"].get("calib_false_per_problem", 0.5), batch_size=64,
+                                        max_sol_len=t["rollout_max_new"])
                 pol = make_policy("dep_head", {**cfg["eval"]["policy"], "window": cfg["revision"]["window"],
-                                               "slack": cfg["revision"]["slack"], "diagnostics": True})
-                rr = decode_revision(raw, eval_set[: t["eval_revision_n"]], pol, tok, device,
+                                               "slack": cfg["revision"]["slack"], "diagnostics": True,
+                                               "tau_err": cal["tau_err"]})
+                rr = decode_revision(raw, eval_set[:nr], pol, tok, device,
                                      batch_size=cfg["eval"]["batch_size"], amp_dtype=amp)
+                rec.update({"eval_tau_err": cal["tau_err"], "eval_detect_recall": cal["detect_recall"]})
                 ev = [e for r in rr for e in r["events"]]
                 rec.update({"eval_dep_head_acc": sum(r["correct"] for r in rr) / len(rr),
                             "eval_same_problems_greedy_acc": sum(r["correct"] for r in res[: len(rr)]) / len(rr),

@@ -42,7 +42,8 @@ class Policy:
     slack_min_len: int = 3
     check_every: int = 1
     confdrop_delta: float = 2.0
-    confdrop_iters: int = 4
+    confdrop_iters: int = 6
+    confdrop_mode: str = "writer"
     require_disagree: bool = True  # fix only where the fix head prefers another token
     max_sol_len: int = 600
     diagnostics: bool = True
@@ -66,7 +67,7 @@ def make_policy(variant, base: dict):
     _, revise, er = VARIANTS[variant]
     p = Policy(name=variant, revise=revise, erase=er)
     for k, v in (base or {}).items():
-        if hasattr(p, k):
+        if hasattr(p, k) and not (k == "tau_err" and v == "auto"):
             setattr(p, k, v)
     return p
 
@@ -138,7 +139,7 @@ class Runner:
             h = self.model(ids, pos, is_copy.long(), mask)
         B = len(items)
         ar = torch.arange(B, device=self.device)
-        out = {"h": h, "coff": coff, "clen": clen}
+        out = {"h": h, "ids": ids, "coff": coff, "clen": clen}
         out["lm"] = self.model.lm_logits(h[ar, torch.tensor(last, device=self.device)]).float()
         Wm = max(clen)
         if Wm > 0:
@@ -158,6 +159,15 @@ class Runner:
             out["disagree"] = fx.scatter(-1, ctok.unsqueeze(-1), cur).argmax(-1) != ctok
             out["fix"] = fx.scatter(-1, ctok.unsqueeze(-1), -1e9).argmax(-1)
         return out
+
+    @torch.no_grad()
+    def writer_logp(self, out, b, positions):
+        """Writer log-prob of the tokens at causal `positions` of row b, and the
+        writer's own prediction there."""
+        p = torch.tensor(positions, device=self.device)
+        logits = self.model.lm_logits(out["h"][b, p - 1]).float()
+        lp = torch.log_softmax(logits, -1).gather(-1, out["ids"][b, p].unsqueeze(-1)).squeeze(-1)
+        return lp.tolist(), logits.argmax(-1).tolist()
 
     @torch.no_grad()
     def dep_row(self, out, b, i):
@@ -318,11 +328,49 @@ def _apply_fixes(runner, slots, fixing, out, policy, tok, metas, seed):
 
 
 def _measure_confdrop(runner, slots, fixing, out, policy, tok, metas):
-    """Dependency by measurement: confidence (re-read fix-head probability of
-    the written token) before vs. after the fix; tokens whose log-probability
-    drops by more than delta are dependent. Iterated: found dependents are
-    masked and the measurement repeated, so that indirect dependents (which
-    are still consistent with the unchanged intermediate tokens) are found."""
+    """Dependency by measurement (variant 4b, and the training target of the
+    dependency head): the model's confidence in every later token before vs.
+    after the fix; tokens whose log-probability drops by more than delta are
+    dependent. Iterated so that indirect dependents are found too."""
+    if policy.confdrop_mode == "reread":
+        return _measure_confdrop_reread(runner, slots, fixing, out, policy, tok, metas)
+    before, cur, D, pos = {}, {}, {}, {}
+    for (b, i, j, new) in fixing:
+        s = slots[b]
+        P = metas[b][0]
+        pos[b] = [P + k for k in range(j + 1, len(s.sol))]
+        before[b] = runner.writer_logp(out, b, pos[b])[0] if pos[b] else []
+        cur[b] = list(s.sol)
+        cur[b][j] = new
+        D[b] = set()
+    active = [f for f in fixing if pos[f[0]]]
+    for it in range(policy.confdrop_iters):
+        if not active:
+            break
+        items = []
+        for (b, i, j, new) in active:
+            s = slots[b]
+            items.append((s.prob.prompt_ids + cur[b], None, 0))
+            s.steps += 1
+            s.tokens += len(s.sol) - j
+        o = runner.forward(items)
+        nxt = []
+        for r, (b, i, j, new) in enumerate(active):
+            P = metas[b][0]
+            after, pred = runner.writer_logp(o, r, pos[b])
+            found = False
+            for q, k in enumerate(range(j + 1, len(cur[b]))):
+                if k not in D[b] and before[b][q] - after[q] > policy.confdrop_delta:
+                    D[b].add(k)
+                    cur[b][k] = pred[q]  # virtual repair
+                    found = True
+            if found:
+                nxt.append((b, i, j, new))
+        active = nxt
+    return {b: sorted(d) for b, d in D.items()}
+
+
+def _measure_confdrop_reread(runner, slots, fixing, out, policy, tok, metas):
     MASK = tok.mask
     before = {b: out["logp_tok"][b, : out["clen"][b]].tolist() for (b, i, j, new) in fixing}
     D = {b: set() for (b, i, j, new) in fixing}
@@ -403,3 +451,58 @@ def decode_majority(model, problems, tok, device, k, batch_size=128, amp_dtype=N
             r["flops"] = 2.0 * n_params * r["tokens"]
         out.append(r)
     return out
+
+
+@torch.no_grad()
+def calibrate_tau_err(model, problems, tok, device, window, amp_dtype=None, false_per_problem=0.5, stride=4,
+                      batch_size=64, max_sol_len=600, require_disagree=True):
+    """Pick the error threshold on the model's own greedy solutions (held-out
+    problems): the largest-scoring position of every window that contains no
+    error yet is a would-be false fix; the threshold is the quantile that
+    allows `false_per_problem` false fixes per solution. Also reports the
+    fraction of windows containing the first error whose top-scoring position
+    is that error and clears the threshold (= detection recall)."""
+    runner = Runner(model, tok, device, amp_dtype)
+    gens, _ = generate(model, [p.prompt_ids for p in problems], max_sol_len, tok.eos, tok.pad, device,
+                       amp_dtype=amp_dtype)
+    items, kinds = [], []  # kind: (is_positive, error index within window or -1)
+    n_steps = 0
+    for p, g in zip(problems, gens):
+        a = analyze(p, g, tok)
+        j = a.first_err
+        n_steps += len(g)
+        P = len(p.prompt_ids)
+        for t in range(1, len(g) + 1, stride):
+            ws = max(0, t - window)
+            if j is None or t <= j:
+                items.append((p.prompt_ids + g[:t], g[ws:t], P + ws))
+                kinds.append((False, -1))
+            elif j >= ws:
+                items.append((p.prompt_ids + g[:t], g[ws:t], P + ws))
+                kinds.append((True, j - ws))
+    neg, pos = [], []
+    for s in range(0, len(items), batch_size):
+        out = runner.forward(items[s:s + batch_size])
+        err = out["err"].masked_fill(~out["cvalid"], 0.0)
+        bad = (out["ctok"] == tok.mask) | (out["ctok"] == tok.null)
+        if require_disagree:
+            bad = bad | ~out["disagree"]
+        err = err.masked_fill(bad, 0.0)
+        mx, arg = err.max(-1)
+        mx, arg = mx.tolist(), arg.tolist()
+        for r, (is_pos, jw) in enumerate(kinds[s:s + batch_size]):
+            if is_pos:
+                pos.append(mx[r] if arg[r] == jw else 0.0)
+            else:
+                neg.append(mx[r])
+    # each negative window stands for `stride` decoding steps
+    n_solutions = max(1, len(problems))
+    allowed = false_per_problem * n_solutions / max(1, stride)
+    neg_sorted = sorted(neg, reverse=True)
+    k = int(allowed)
+    tau = neg_sorted[k] if k < len(neg_sorted) else 0.0
+    tau = float(min(0.95, max(0.02, tau + 1e-6)))
+    recall = sum(1 for x in pos if x > tau) / max(1, len(pos))
+    return {"tau_err": tau, "detect_recall": recall, "n_pos_windows": len(pos), "n_neg_windows": len(neg),
+            "greedy_acc": sum(analyze(p, g, tok).correct for p, g in zip(problems, gens)) / max(1, len(problems)),
+            "mean_pos_score": sum(pos) / max(1, len(pos)), "false_per_problem": false_per_problem}

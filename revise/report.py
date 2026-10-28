@@ -36,9 +36,16 @@ def write_report(cfg):
     lines.append(f"Model: d_model={cfg['model']['d_model']}, layers={cfg['model']['n_layers']}; "
                  f"window={cfg['revision']['window']} tokens; dep target={cfg['revision']['dep_target']}; "
                  f"max fixes/problem={cfg['eval']['policy']['max_fixes']}.")
+    summary = dict(summary)
     lines.append("All revision variants share one model (trained at the same FLOPs as the plain model); they differ "
                  "only in what is erased after a fix. FLOPs are per problem, relative to plain greedy decoding, "
                  "counted as if the unchanged prefix were KV-cached.")
+    calib = summary.pop("calibration", None)
+    if calib:
+        lines.append(f"Error threshold calibrated on {calib['n_pos_windows'] + calib['n_neg_windows']} windows of the "
+                     f"model's own held-out solutions: tau_err={calib['tau_err']:.3f} (allows "
+                     f"{calib['false_per_problem']} false fixes per solution); detection recall at that threshold "
+                     f"{100 * calib['detect_recall']:.1f}%.")
     lines.append("")
     for set_name, rows in summary.items():
         ops = {"id": cfg["data"]["op_test_id"], "ood": cfg["data"]["op_test_ood"]}[set_name]
@@ -95,7 +102,9 @@ def _plot(summary, out_dir):
             if s.get("flops_x_plain") is None:
                 continue
             groups.setdefault(base, []).append((s["flops_x_plain"], s["acc"]))
-        for base, pts in sorted(groups.items()):
+        order = [k for k in LABELS if k in groups] + sorted(k for k in groups if k not in LABELS)
+        for base in order:
+            pts = groups[base]
             pts.sort()
             ax.plot([p[0] for p in pts], [100 * p[1] for p in pts], marker="o", label=LABELS.get(base, base))
         ax.set_xscale("log")

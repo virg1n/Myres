@@ -27,7 +27,8 @@ DEFAULTS = {
         "window": 64, "slack": 4, "slack_min_len": 3, "identity_w": 0.2,
         "mask_patterns": [0.5, 0.2, 0.15, 0.15],  # dag, span, line, random
         "dep_target": "confdrop",  # confdrop | oracle
-        "confdrop_delta": 2.0, "confdrop_iters": 4,
+        "confdrop_mode": "writer",  # writer (LM log-prob of later tokens) | reread (fix-head log-prob)
+        "confdrop_delta": 2.0, "confdrop_iters": 6,
         "neg_window_prob": 0.5, "lm_on_self": False,
     },
     "train": {
@@ -46,8 +47,9 @@ DEFAULTS = {
         "n_test": 1000, "batch_size": 128, "plain_batch_size": 256,
         "variants": ["plain", "fix_only", "erase_suffix", "dep_head", "oracle_dep", "dep_head_lines",
                      "random_erase", "confdrop_measure", "revision_model_no_revision"],
-        "policy": {"tau_err": 0.5, "tau_dep": 0.5, "max_fixes": 8, "check_every": 1, "max_sol_len": 600,
+        "policy": {"tau_err": "auto", "tau_dep": 0.5, "max_fixes": 8, "check_every": 1, "max_sol_len": 600,
                    "diagnostics": True},
+        "calib_n": 256, "calib_false_per_problem": 0.5,
         "sweep_max_fixes": [],
         "majority_k": "auto", "majority_k_max": 32, "majority_temp": 0.7,
     },

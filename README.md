@@ -66,7 +66,7 @@ token *k* depends on token *j*.
 
 **Decoding** (`revise/decode.py`). One forward pass per step gives both the next-token distribution and the
 window predictions. If the window contains erased tokens, the leftmost one is filled. Otherwise, if some
-token has err > `tau_err` and the fix head also prefers another token there, the most likely error is replaced
+token has err > `tau_err` (calibrated, see below) and the fix head also prefers another token there, the most likely error is replaced
 by the fix head's choice. Otherwise the next token is written. Never more than one
 action per step. Because `dep[j, :]` comes out of the same pass that chose *j*, the method needs no extra pass
 to find dependents. Erasure: a dependent run that reaches the end of the text is truncated and rewritten.
@@ -74,12 +74,23 @@ Runs in the middle become `<mask>` tokens and are filled in place (long runs get
 filled with `<null>`, so regenerated text can be shorter). A budget (`max_fixes`) caps revisions per problem.
 
 **Finding dependents by confidence drop** (`confdrop_targets` in `revise/train.py`, `_measure_confdrop` in
-`decode.py`). Before vs. after the fix, compare the re-read model's log-probability of every later token in the
-window; a drop above `confdrop_delta` (2 nats) marks it as dependent. A single comparison misses indirect
-dependents: in `q = p + 2 = 7 + 2 = 9`, after fixing p's value the `7` loses confidence but the `9` stays
-consistent with `7 + 2`. So the measurement is repeated with the dependents found so far masked, until nothing
+`decode.py`). Confidence is the writer's log-probability of each later token given the text before it, on the
+model's own text vs. the same text with the error fixed; a drop above `confdrop_delta` (2 nats) marks the
+token as dependent. A single comparison misses indirect dependents: in `q = p + 2 = 7 + 2 = 9`, after fixing p's
+value the `7` loses confidence but the `9` is still consistent with `7 + 2`. So the dependents found are replaced
+by what the model would now write, and the measurement is repeated (up to `confdrop_iters` passes) until nothing
 new drops. These measured labels are the training target of the dependency head (`revision.dep_target:
-confdrop`). Set `dep_target: oracle` to train the head on the generator's graph instead.
+confdrop`); `dep_target: oracle` trains it on the generator's graph instead. (`confdrop_mode: reread` uses the
+re-read fix head as the confidence instead. That head sees the token it scores, so it learns "the visible token
+is fine" and barely reacts to an earlier fix: in a test run it produced no dependents at all.)
+`tests/test_confdrop.py` checks the measurement with a scripted, perfectly consistent writer. It must find
+every token that changes and never flag a token outside the true dependency graph.
+
+**Error threshold.** Errors are rare among window tokens, so the error head's probabilities are low and a fixed
+0.5 threshold may never fire. With `eval.policy.tau_err: auto` the threshold is calibrated on the model's own
+greedy solutions to 256 held-out problems (different seed from the test sets). It is set so that about
+`calib_false_per_problem` (0.5) false fixes per solution are expected on text that has no error yet. The same
+threshold is used for every variant; the detection recall at that threshold is printed in the report.
 
 **Training** (`revise/train.py`).
 1. *Plain stage:* causal LM on correct solutions. Its FLOPs define the budget; the checkpoint at 50 % is saved.
