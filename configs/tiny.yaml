@@ -1,0 +1,33 @@
+# Smoke test: runs the full pipeline in a few minutes (also works on CPU).
+name: tiny
+data:
+  op_train: [2, 6]
+  op_rollout: [3, 6]
+  op_test_id: [4, 6]
+  op_test_ood: [7, 8]
+  gen: {items_per_layer: [2, 3], max_instance_params: 10}
+model: {d_model: 64, n_layers: 2, n_heads: 4, d_ff: 128, dep_dim: 32, max_pos: 1024}
+revision: {window: 32}
+train:
+  batch_size: 8
+  plain_steps: 40
+  branch_frac: 0.5
+  lr: 3.0e-3
+  rollout_every: 10
+  rollout_problems: 16
+  rollout_batch: 16
+  rollout_max_new: 200
+  min_buffer: 4
+  dep_warmup_steps: 2
+  num_workers: 1
+  log_every: 5
+  save_every: 20
+  eval_every: 20
+  eval_n: 16
+eval:
+  n_test: 12
+  batch_size: 8
+  plain_batch_size: 16
+  policy: {max_sol_len: 200, max_fixes: 3}
+  sweep_max_fixes: [1, 2]
+  majority_k_max: 3
