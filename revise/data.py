@@ -2,6 +2,7 @@
 downloaded or stored on disk (the 40 GB storage limit only applies to
 checkpoints and results)."""
 
+import multiprocessing
 import random
 
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
@@ -43,5 +44,11 @@ class CorrectStream(IterableDataset):
 
 def make_loader(cfg, stage, n, seed, num_workers):
     ds = CorrectStream(cfg, stage, n, seed)
+    # Workers only run Python (no CUDA), so plain fork is safe and avoids the forkserver
+    # default of Python >= 3.14, whose socket directory in $TMPDIR cannot be removed at
+    # exit on network filesystems ("OSError: Directory not empty: .../pymp-...").
+    ctx = None
+    if num_workers > 0 and "fork" in multiprocessing.get_all_start_methods():
+        ctx = multiprocessing.get_context("fork")
     return DataLoader(ds, batch_size=None, num_workers=num_workers, persistent_workers=num_workers > 0,
-                      prefetch_factor=4 if num_workers > 0 else None)
+                      prefetch_factor=4 if num_workers > 0 else None, multiprocessing_context=ctx)

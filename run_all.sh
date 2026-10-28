@@ -26,6 +26,8 @@ fi
 [[ "$NGPU" -lt 1 ]] && NGPU=1
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
 export PYTHONUNBUFFERED=1
+# hide harmless c10d warnings (IPv6 localhost attempts before falling back to IPv4)
+export TORCH_CPP_LOG_LEVEL="${TORCH_CPP_LOG_LEVEL:-ERROR}"
 PY="${PYTHON:-$(command -v python || command -v python3)}"
 
 NAME=$("$PY" -c "import sys; from revise.utils import load_config; print(load_config(sys.argv[1], sys.argv[2:])['out_dir'])" "$CONFIG" ${OVERRIDES[@]+"${OVERRIDES[@]}"})

@@ -86,13 +86,8 @@ def load_config(path, overrides=()):
 # ---------------------------------------------------------------------------
 
 def init_dist():
-    if "RANK" in os.environ and int(os.environ.get("WORLD_SIZE", "1")) > 1:
-        backend = "nccl" if torch.cuda.is_available() else "gloo"
-        dist.init_process_group(backend)
-        rank, world = dist.get_rank(), dist.get_world_size()
-        local = int(os.environ.get("LOCAL_RANK", 0))
-    else:
-        rank, world, local = 0, 1, 0
+    distributed = "RANK" in os.environ and int(os.environ.get("WORLD_SIZE", "1")) > 1
+    local = int(os.environ.get("LOCAL_RANK", 0)) if distributed else 0
     if torch.cuda.is_available():
         torch.cuda.set_device(local)
         device = torch.device("cuda", local)
@@ -100,6 +95,17 @@ def init_dist():
         torch.backends.cudnn.allow_tf32 = True
     else:
         device = torch.device("cpu")
+    if distributed:
+        if device.type == "cuda":
+            try:
+                dist.init_process_group("nccl", device_id=device)
+            except TypeError:  # older torch without device_id
+                dist.init_process_group("nccl")
+        else:
+            dist.init_process_group("gloo")
+        rank, world = dist.get_rank(), dist.get_world_size()
+    else:
+        rank, world = 0, 1
     return rank, world, device
 
 
