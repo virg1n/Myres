@@ -55,6 +55,26 @@ how often a fix hits a real error, and the precision and recall of the erased se
 dependents. These are given for the in-distribution test set (op 10–15) and a harder out-of-distribution set
 (op 16–20), with accuracy broken down by number of operations.
 
+## Frozen-writer setup (recommended)
+
+In the first pilot (`configs/small.yaml`), training the revision objective on the shared network degraded the
+writer: 62% vs. 78% for the plain model, even when branching at 90% of training. That hides any effect of
+revision. `configs/small_frozen.yaml` removes this confound:
+
+- **Writer:** an already trained plain model (`revision.writer_path`) writes for every variant, unchanged. Its
+  accuracy is variant 1.
+- **Reviser:** a separate copy of it plus the error/fix/dependency heads, trained for `train.reviser_steps` on the
+  writer's own mistakes. Confidence-drop labels are measured with the frozen writer. Its training FLOPs are
+  logged as `reviser_flops_x_plain_training`.
+- **Oracle detection:** every erasure policy is also evaluated with oracle error detection (`@oracledetect` rows):
+  the checker finds the true first error, it is fixed with the correct token `oracle_delay` tokens after it was
+  written, and the policy decides what else to erase. This answers "does erasing only dependents beat erasing
+  everything / nothing?" independently of how well the model detects its own errors.
+
+```bash
+bash run_all.sh configs/small_frozen.yaml     # needs runs/small_b/plain/final.pt
+```
+
 ## How the idea is implemented
 
 **Window and re-reading** (`revise/model.py`). One transformer, two streams packed into one sequence:
@@ -135,7 +155,7 @@ erase precision/recall diagnostics.
 
 ```
 run_all.sh                 one command: train plain -> train revision -> evaluate -> report
-configs/{tiny,small,base}.yaml
+configs/{tiny,small,small_frozen,base}.yaml
 revise/igsm/generator.py   iGSM-style generator (dependency graph, values, problem/solution text)
 revise/igsm/checker.py     labeller: root errors, valid fixes, token dependency DAG, final answer
 revise/model.py            two-stream transformer, attention mask, heads, KV cache

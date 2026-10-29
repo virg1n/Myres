@@ -132,14 +132,14 @@ def compute_losses(m, h, batch, cfg, step, stage):
 
 
 @torch.no_grad()
-def confdrop_targets(m, h, batch, cfg, amp, mask_id):
+def confdrop_targets(m, h, batch, cfg, amp, mask_id, writer=None):
     """Fill batch['dep_t'] rows marked for confidence-drop measurement:
     tokens after the error whose confidence drops by more than `delta` nats
     once the error is fixed are labelled dependent. Returns tokens processed."""
     if not batch["confdrop"]:
         return 0
     if cfg["revision"].get("confdrop_mode", "writer") == "writer":
-        return _confdrop_writer(m, h, batch, cfg, amp)
+        return _confdrop_writer(m if writer is None else writer, None if writer is not None else h, batch, cfg, amp)
     return _confdrop_reread(m, h, batch, cfg, amp, mask_id)
 
 
@@ -172,12 +172,16 @@ def _confdrop_writer(m, h, batch, cfg, amp):
         lp = torch.log_softmax(logits, -1).gather(-1, ids[sel[:, None], cpos].unsqueeze(-1)).squeeze(-1)
         return lp, logits.argmax(-1)
 
-    before, _ = logp_next(h.detach(), batch["ids"], rb)
+    processed = 0
+    if h is None:  # separate (frozen) writer: one extra pass for the "before" confidences
+        processed += int(sub["valid"].sum())
+        before, _ = logp_next(forward_batch(m, sub, amp), sub["ids"], ar)
+    else:
+        before, _ = logp_next(h.detach(), batch["ids"], rb)
     ids = sub["ids"].clone()
     ids[ar, wst + j] = ft
     dep = torch.zeros(R, Wm, dtype=torch.bool, device=dev)
     active = torch.ones(R, dtype=torch.bool, device=dev)
-    processed = 0
     for it in range(iters):
         act = active.nonzero().squeeze(1)  # only rows that still found new dependents
         part = {k: v[act] for k, v in sub.items()}
@@ -246,13 +250,13 @@ def _confdrop_reread(m, h, batch, cfg, amp, mask_id):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
-    ap.add_argument("--stage", choices=["plain", "revise"], required=True)
+    ap.add_argument("--stage", choices=["plain", "revise", "reviser"], required=True)
     ap.add_argument("overrides", nargs="*")
     args = ap.parse_args()
     cfg = load_config(args.config, args.overrides)
     rank, world, device = init_dist()
     t = cfg["train"]
-    seed = cfg["seed"] + (0 if args.stage == "plain" else 7919) + 104729 * rank
+    seed = cfg["seed"] + {"plain": 0, "revise": 7919, "reviser": 15485863}[args.stage] + 104729 * rank
     torch.manual_seed(seed)
     random.seed(seed)
     amp = amp_dtype(cfg) if device.type == "cuda" else None
@@ -277,12 +281,28 @@ def main():
 
     # ---- budget / init --------------------------------------------------
     step, flops = 0, 0.0
+    writer = None
     if args.stage == "plain":
         for p in model.revision_parameters():
             p.requires_grad_(False)
         total_steps = t["plain_steps"]
         branch_step = max(1, int(round(t["branch_frac"] * total_steps)))
         budget = None
+    elif args.stage == "reviser":
+        # frozen writer = the finished plain model; the reviser starts as a copy of it
+        wpath = cfg["revision"].get("writer_path") or os.path.join(plain_dir, "final.pt")
+        ck = torch.load(wpath, map_location="cpu")
+        writer = build_model(cfg, tok).to(device).eval()
+        writer.load_state_dict(ck["model"])
+        for p in writer.parameters():
+            p.requires_grad_(False)
+        model.load_state_dict(ck["model"])
+        total_steps = t["reviser_steps"]
+        budget = None
+        bpath = os.path.join(os.path.dirname(wpath), "budget.json")
+        plain_flops = json.load(open(bpath))["total_flops"] if os.path.exists(bpath) else None
+        if rank == 0:
+            print(f"reviser: frozen writer {wpath}; training a separate reviser for {total_steps} steps")
     else:
         with open(os.path.join(plain_dir, "budget.json")) as f:
             budget = json.load(f)
@@ -324,7 +344,7 @@ def main():
     eval_set = make_test_set(gcfg, cfg["data"]["op_test_id"], t["eval_n"], cfg["seed"] + 99, tok) if rank == 0 else None
 
     def do_rollouts(n):
-        entries, stats, proc = collect_rollouts(raw, sampler, tok, n, device, t["rollout_temps"],
+        entries, stats, proc = collect_rollouts(writer if writer is not None else raw, sampler, tok, n, device, t["rollout_temps"],
                                                 t["rollout_max_new"], amp, t["rollout_batch"],
                                                 cfg["data"]["op_rollout"], rrng, cfg["data"]["strict_necessary"])
         for e in entries:
@@ -333,14 +353,14 @@ def main():
         return stats, proc
 
     def done():
-        if args.stage == "plain":
+        if args.stage in ("plain", "reviser"):
             return step >= total_steps
         return flops >= budget["total_flops"]
 
     t_start = time.time()
     tok_count, last_log = 0, time.time()
     roll_stats = {}
-    if args.stage == "revise":
+    if args.stage != "plain":
         tries = 0
         while all_reduce_sum(len(buffer) < t["min_buffer"], device) > 0 and tries < 20:
             roll_stats, proc = do_rollouts(t["rollout_problems"])
@@ -354,7 +374,7 @@ def main():
         if (time.time() - t_start) / 3600 > t["max_hours"]:
             break
         # rollouts of the current model
-        if args.stage == "revise" and step > 0 and step % t["rollout_every"] == 0:
+        if args.stage != "plain" and step > 0 and step % t["rollout_every"] == 0:
             roll_stats, proc = do_rollouts(t["rollout_problems"])
             flops += 2.0 * N * all_reduce_sum(proc, device)
 
@@ -364,8 +384,13 @@ def main():
             exs = exs + [error_example(e, rrng, tok, cfg["revision"]) for e in errs]
         batch = to_device(collate(exs, tok.pad), device)
 
-        frac = step / total_steps if args.stage == "plain" else flops / budget["total_flops"]
-        lr = lr_at(frac, cfg)
+        if args.stage == "reviser":
+            frac = step / total_steps
+            lr = lr_at(frac, {"train": {"lr": t["reviser_lr"], "min_lr": t["reviser_min_lr"],
+                                        "warmup_frac": t["reviser_warmup_frac"]}})
+        else:
+            frac = step / total_steps if args.stage == "plain" else flops / budget["total_flops"]
+            lr = lr_at(frac, cfg)
         if args.stage == "revise":
             lr *= min(1.0, (step + 1) / max(1, t["rewarmup_steps"]))
         for g in opt.param_groups:
@@ -373,8 +398,8 @@ def main():
 
         h = forward_batch(ddp, batch, amp)
         extra = 0
-        if args.stage == "revise" and batch["confdrop"] and step >= t["dep_warmup_steps"]:
-            extra = confdrop_targets(raw, h, batch, cfg, amp, tok.mask)
+        if args.stage != "plain" and batch["confdrop"] and step >= t["dep_warmup_steps"]:
+            extra = confdrop_targets(raw, h, batch, cfg, amp, tok.mask, writer=writer)
         loss, metrics, _ = compute_losses(raw, h, batch, cfg, step, args.stage)
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -398,25 +423,31 @@ def main():
             rec = {"stage": args.stage, "step": step, "lr": lr, "loss": loss.item(), "gnorm": gn.item(),
                    "flops": flops, "frac": round(frac, 4), "tok_per_s": tok_count * world / max(dt, 1e-6),
                    **metrics}
-            if args.stage == "revise":
+            if args.stage != "plain":
                 rec.update({"buffer": len(buffer), **roll_stats})
+            if args.stage == "reviser" and plain_flops:
+                rec["reviser_flops_x_plain_training"] = flops / plain_flops
             tok_count = 0
             log.log(rec)
 
         if step % t["eval_every"] == 0 and rank == 0:
-            res = decode_plain(raw, eval_set, tok, device, batch_size=t["rollout_batch"], amp_dtype=amp,
-                               max_sol_len=t["rollout_max_new"])
+            res = decode_plain(writer if writer is not None else raw, eval_set, tok, device,
+                               batch_size=t["rollout_batch"], amp_dtype=amp, max_sol_len=t["rollout_max_new"])
             rec = {"stage": args.stage, "step": step, "eval_greedy_acc": sum(r["correct"] for r in res) / len(res)}
-            if args.stage == "revise" and t.get("eval_revision_n", 0):
+            if args.stage != "plain" and t.get("eval_revision_n", 0):
                 nr = min(t["eval_revision_n"], len(eval_set) // 2)
                 cal = calibrate_tau_err(raw, eval_set[-nr:], tok, device, cfg["revision"]["window"], amp,
                                         cfg["eval"].get("calib_false_per_problem", 0.5), batch_size=64,
-                                        max_sol_len=t["rollout_max_new"])
+                                        max_sol_len=t["rollout_max_new"], writer=writer)
                 pol = make_policy("dep_head", {**cfg["eval"]["policy"], "window": cfg["revision"]["window"],
                                                "slack": cfg["revision"]["slack"], "diagnostics": True,
                                                "tau_err": cal["tau_err"]})
                 rr = decode_revision(raw, eval_set[:nr], pol, tok, device,
-                                     batch_size=cfg["eval"]["batch_size"], amp_dtype=amp)
+                                     batch_size=cfg["eval"]["batch_size"], amp_dtype=amp, writer=writer)
+                pol_o = make_policy("dep_head", {**vars(pol), "detect": "oracle"})
+                ro = decode_revision(raw, eval_set[:nr], pol_o, tok, device,
+                                     batch_size=cfg["eval"]["batch_size"], amp_dtype=amp, writer=writer)
+                rec["eval_oracle_detect_dep_head_acc"] = sum(r["correct"] for r in ro) / len(ro)
                 rec.update({"eval_tau_err": cal["tau_err"], "eval_detect_recall": cal["detect_recall"]})
                 ev = [e for r in rr for e in r["events"]]
                 rec.update({"eval_dep_head_acc": sum(r["correct"] for r in rr) / len(rr),

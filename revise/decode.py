@@ -45,6 +45,9 @@ class Policy:
     confdrop_iters: int = 6
     confdrop_mode: str = "writer"
     require_disagree: bool = True  # fix only where the fix head prefers another token
+    detect: str = "model"  # model: error head decides | oracle: checker finds the true first error
+    oracle_delay: int = 24  # oracle detection fixes an error only this many tokens after it was written
+    oracle_scan_every: int = 4
     max_sol_len: int = 600
     diagnostics: bool = True
 
@@ -84,6 +87,8 @@ class Slot:
     fills: int = 0
     erased: int = 0
     since_check: int = 0
+    known_err: tuple = None  # oracle detection: (position, valid tokens) of the first error
+    last_scan: int = -10 ** 9
     done: bool = False
     events: list = field(default_factory=list)
 
@@ -121,10 +126,14 @@ def pack(items, pad, device):
 
 
 class Runner:
-    """Holds the model and runs packed forward passes returning head outputs."""
+    """Runs packed forward passes and returns head outputs. `model` provides the
+    re-read heads (error / fix / dependency); `writer` (default: the same model)
+    provides the next-token distribution."""
 
-    def __init__(self, model, tok, device, amp_dtype=None):
+    def __init__(self, model, tok, device, amp_dtype=None, writer=None):
         self.model, self.tok, self.device = model, tok, device
+        self.writer = writer if writer is not None else model
+        self.separate = self.writer is not self.model
         self.amp = amp_dtype if device.type == "cuda" else None
         V = len(tok)
         self.no_fix = torch.zeros(V, dtype=torch.bool, device=device)
@@ -134,14 +143,27 @@ class Runner:
 
     @torch.no_grad()
     def forward(self, items):
+        if not self.separate:
+            out = self._forward(self.model, items)
+            out["h_w"], out["ids_w"] = out["h"], out["ids"]
+            return out
+        ow = self._forward(self.writer, [(c, None, 0) for c, _, _ in items], heads=False)
+        if any(w for _, w, _ in items):
+            out = self._forward(self.model, items)
+        else:
+            out = {"coff": ow["coff"], "clen": ow["clen"]}
+        out["lm"], out["h_w"], out["ids_w"] = ow["lm"], ow["h"], ow["ids"]
+        return out
+
+    def _forward(self, model, items, heads=True):
         ids, pos, is_copy, mask, last, coff, clen = pack(items, self.tok.pad, self.device)
         with torch.autocast(self.device.type, dtype=self.amp, enabled=self.amp is not None):
-            h = self.model(ids, pos, is_copy.long(), mask)
+            h = model(ids, pos, is_copy.long(), mask)
         B = len(items)
         ar = torch.arange(B, device=self.device)
         out = {"h": h, "ids": ids, "coff": coff, "clen": clen}
-        out["lm"] = self.model.lm_logits(h[ar, torch.tensor(last, device=self.device)]).float()
-        Wm = max(clen)
+        out["lm"] = model.lm_logits(h[ar, torch.tensor(last, device=self.device)]).float()
+        Wm = max(clen) if heads else 0
         if Wm > 0:
             idx = torch.tensor(coff, device=self.device)[:, None] + torch.arange(Wm, device=self.device)[None]
             cvalid = torch.arange(Wm, device=self.device)[None] < torch.tensor(clen, device=self.device)[:, None]
@@ -165,8 +187,8 @@ class Runner:
         """Writer log-prob of the tokens at causal `positions` of row b, and the
         writer's own prediction there."""
         p = torch.tensor(positions, device=self.device)
-        logits = self.model.lm_logits(out["h"][b, p - 1]).float()
-        lp = torch.log_softmax(logits, -1).gather(-1, out["ids"][b, p].unsqueeze(-1)).squeeze(-1)
+        logits = self.writer.lm_logits(out["h_w"][b, p - 1]).float()
+        lp = torch.log_softmax(logits, -1).gather(-1, out["ids_w"][b, p].unsqueeze(-1)).squeeze(-1)
         return lp.tolist(), logits.argmax(-1).tolist()
 
     @torch.no_grad()
@@ -184,8 +206,8 @@ def _lines_erasure(sol, j, D, tok):
 
 
 def decode_revision(model, problems, policy: Policy, tok, device, batch_size=64, amp_dtype=None, seed=0,
-                    n_params=None, log_every=0):
-    runner = Runner(model, tok, device, amp_dtype)
+                    n_params=None, log_every=0, writer=None):
+    runner = Runner(model, tok, device, amp_dtype, writer=writer)
     MASK, NULL, EOS = tok.mask, tok.null, tok.eos
     queue = collections.deque(enumerate(problems))
     slots, results = [], [None] * len(problems)
@@ -207,7 +229,8 @@ def decode_revision(model, problems, policy: Policy, tok, device, batch_size=64,
             copy = s.sol[ws:] if check else None
             items.append((s.prob.prompt_ids + s.sol, copy, P + ws))
             metas.append((P, ws, check))
-            s.tokens += (P + len(s.sol) - s.dirty) + (len(copy) if copy else 0)
+            new_causal = P + len(s.sol) - s.dirty
+            s.tokens += new_causal * (2 if (runner.separate and check) else 1) + (len(copy) if copy else 0)
             s.dirty = P + len(s.sol)
             s.steps += 1
         out = runner.forward(items)
@@ -241,7 +264,14 @@ def decode_revision(model, problems, policy: Policy, tok, device, batch_size=64,
                 s.fills += 1
                 s.dirty = min(s.dirty, P + m)
                 s.since_check = 0
-            elif check and s.fixes < policy.max_fixes and err_max[b] > policy.tau_err:
+                s.known_err, s.last_scan = None, -10 ** 9
+            elif check and policy.detect == "oracle" and s.fixes < policy.max_fixes \
+                    and (oe := _oracle_error(s, tok, policy, ws)) is not None:
+                j, new = oe
+                fixing.append((b, j - ws, j, new))
+                s.since_check = 0
+                s.known_err, s.last_scan = None, -10 ** 9
+            elif check and policy.detect == "model" and s.fixes < policy.max_fixes and err_max[b] > policy.tau_err:
                 i = err_arg[b]
                 fixing.append((b, i, ws + i, fix_tok[b][i]))
                 s.since_check = 0
@@ -272,6 +302,30 @@ def decode_revision(model, problems, policy: Policy, tok, device, batch_size=64,
     return results
 
 
+def _oracle_error(s, tok, policy, ws):
+    """Oracle detection: the checker's first (root) error, released for fixing
+    once `oracle_delay` more tokens have been written after it (or the solution
+    ended / the error is about to leave the window). Returns (j, fix token)."""
+    L = len(s.sol)
+    ended = L > 0 and s.sol[-1] == tok.eos
+    if s.known_err is None and (L - s.last_scan >= policy.oracle_scan_every or ended):
+        a = analyze(s.prob, s.sol, tok)
+        s.last_scan = L
+        j = a.first_err
+        if j is not None and a.valid[j]:
+            s.known_err = (j, a.valid[j][0])
+    if s.known_err is None:
+        return None
+    j, new = s.known_err
+    if j < ws:  # fell out of the window: can no longer be fixed
+        s.known_err = None
+        return None
+    delay = min(policy.oracle_delay, policy.window - 2)
+    if L - 1 - j >= delay or ended:
+        return j, new
+    return None
+
+
 def _apply_fixes(runner, slots, fixing, out, policy, tok, metas, seed):
     MASK = tok.mask
     dep_sets = {}
@@ -288,7 +342,7 @@ def _apply_fixes(runner, slots, fixing, out, policy, tok, metas, seed):
         P = metas[b][0]
         old = s.sol[j]
         before = list(s.sol)
-        ev = {"j": j, "old": old, "new": new, "len": len(before)}
+        ev = {"j": j, "old": old, "new": new, "len": len(before), "lag": len(before) - 1 - j}
         an = None
         if policy.diagnostics or policy.erase == "oracle":
             an = analyze(s.prob, before, tok)
@@ -455,15 +509,15 @@ def decode_majority(model, problems, tok, device, k, batch_size=128, amp_dtype=N
 
 @torch.no_grad()
 def calibrate_tau_err(model, problems, tok, device, window, amp_dtype=None, false_per_problem=0.5, stride=4,
-                      batch_size=64, max_sol_len=600, require_disagree=True):
+                      batch_size=64, max_sol_len=600, require_disagree=True, writer=None):
     """Pick the error threshold on the model's own greedy solutions (held-out
     problems): the largest-scoring position of every window that contains no
     error yet is a would-be false fix; the threshold is the quantile that
     allows `false_per_problem` false fixes per solution. Also reports the
     fraction of windows containing the first error whose top-scoring position
     is that error and clears the threshold (= detection recall)."""
-    runner = Runner(model, tok, device, amp_dtype)
-    gens, _ = generate(model, [p.prompt_ids for p in problems], max_sol_len, tok.eos, tok.pad, device,
+    runner = Runner(model, tok, device, amp_dtype, writer=writer)
+    gens, _ = generate(runner.writer, [p.prompt_ids for p in problems], max_sol_len, tok.eos, tok.pad, device,
                        amp_dtype=amp_dtype)
     items, kinds = [], []  # kind: (is_positive, error index within window or -1)
     n_steps = 0

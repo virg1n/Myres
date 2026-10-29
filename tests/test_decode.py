@@ -67,11 +67,11 @@ class FakeRunner(D.Runner):
                 "clen": [len(w) if w else 0 for _, w, _ in items], "coff": [len(c) for c, _, _ in items]}
 
 
-def _run(policy_name, monkeypatch):
+def _run(policy_name, monkeypatch, **policy_kw):
     p, j0 = _setup()
     model = RevisionLM(ModelConfig(vocab_size=len(TOK), d_model=16, n_layers=1, n_heads=2, d_ff=32))
-    monkeypatch.setattr(D, "Runner", lambda m, tok, dev, amp=None: FakeRunner(m, tok, dev, p, j0))
-    pol = D.make_policy(policy_name, {"window": 64, "max_sol_len": 800, "slack_min_len": 99})
+    monkeypatch.setattr(D, "Runner", lambda m, tok, dev, amp=None, writer=None: FakeRunner(m, tok, dev, p, j0))
+    pol = D.make_policy(policy_name, {"window": 64, "max_sol_len": 800, "slack_min_len": 99, **policy_kw})
     res = D.decode_revision(model, [p], pol, TOK, torch.device("cpu"), batch_size=1)[0]
     return p, j0, res
 
@@ -94,3 +94,25 @@ def test_suffix_erasure_rewrites_tail(monkeypatch):
 def test_fix_only(monkeypatch):
     p, j0, r = _run("fix_only", monkeypatch)
     assert r["fixes"] == 1 and r["erased"] == 0 and r["correct"]
+
+
+class SilentDetector(FakeRunner):
+    """Same scripted writer, but the error head never fires."""
+
+    def forward(self, items):
+        out = super().forward(items)
+        out["err"] = out["err"] * 0
+        return out
+
+
+def test_oracle_detection_fixes_after_delay(monkeypatch):
+    p, j0 = _setup()
+    model = RevisionLM(ModelConfig(vocab_size=len(TOK), d_model=16, n_layers=1, n_heads=2, d_ff=32))
+    monkeypatch.setattr(D, "Runner", lambda m, tok, dev, amp=None, writer=None: SilentDetector(m, tok, dev, p, j0))
+    for erase in ("oracle_dep", "erase_suffix"):
+        pol = D.make_policy(erase, {"window": 64, "max_sol_len": 800, "slack_min_len": 99,
+                                    "detect": "oracle", "oracle_delay": 12, "oracle_scan_every": 1})
+        r = D.decode_revision(model, [p], pol, TOK, torch.device("cpu"), batch_size=1)[0]
+        assert r["correct"] and r["fixes"] == 1
+        ev = r["events"][0]
+        assert ev["j"] == j0 and ev["lag"] == 12 and ev["fix_valid"]

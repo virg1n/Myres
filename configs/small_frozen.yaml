@@ -1,0 +1,22 @@
+# Frozen-writer experiment. The writer is the finished plain model of the `small_b` run
+# (78% in-distribution); it is NOT trained further, so every variant writes exactly like
+# variant 1. A separate reviser (a copy of the writer + error/fix/dependency heads) is
+# trained on the writer's own mistakes and does all revising.
+base: small.yaml
+name: small_f
+
+revision:
+  frozen_writer: true
+  writer_path: runs/small_b/plain/final.pt
+
+train:
+  reviser_steps: 6000      # reviser training (its FLOPs are logged relative to the plain run)
+  reviser_lr: 3.0e-4
+  eval_every: 1500
+
+eval:
+  variants: [plain, fix_only, erase_suffix, dep_head, oracle_dep, dep_head_lines, random_erase, confdrop_measure]
+  # the same erasure policies with oracle error detection: the true first error is fixed
+  # `oracle_delay` tokens after it was written, then each policy decides what else to erase
+  oracle_detect_variants: [fix_only, erase_suffix, dep_head, oracle_dep, dep_head_lines, random_erase, confdrop_measure]
+  oracle_delay: 24

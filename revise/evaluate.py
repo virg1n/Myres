@@ -61,6 +61,7 @@ def summarize(res, plain_flops=None):
         tp, ne, nt = sum(e["tp"] for e in ev), sum(e["n_erase"] for e in ev), sum(e["n_true_dep"] for e in ev)
         s["erase_precision_vs_true_deps"] = tp / max(1, ne)
         s["erase_recall_vs_true_deps"] = tp / max(1, nt)
+        s["lag_per_fix"] = sum(e.get("lag", 0) for e in ev) / len(ev)
     by_op = {}
     for r in res:
         by_op.setdefault(r["op"], []).append(r["correct"])
@@ -85,9 +86,16 @@ def main():
     out_dir = os.path.join(cfg["out_dir"], "results")
     os.makedirs(out_dir, exist_ok=True)
 
-    plain = load_model(os.path.join(cfg["out_dir"], "plain", "final.pt"), cfg, tok, device)
-    rev_path = os.path.join(cfg["out_dir"], "revise", "final.pt")
+    frozen = bool(cfg["revision"].get("frozen_writer"))
+    if frozen:  # the plain model writes for every variant; a separately trained reviser revises
+        wpath = cfg["revision"].get("writer_path") or os.path.join(cfg["out_dir"], "plain", "final.pt")
+        plain = load_model(wpath, cfg, tok, device)
+        rev_path = os.path.join(cfg["out_dir"], "reviser", "final.pt")
+    else:
+        plain = load_model(os.path.join(cfg["out_dir"], "plain", "final.pt"), cfg, tok, device)
+        rev_path = os.path.join(cfg["out_dir"], "revise", "final.pt")
     rev = load_model(rev_path, cfg, tok, device) if os.path.exists(rev_path) else None
+    writer = plain if frozen else None
     N = plain.n_params()
     gcfg = GenConfig.from_dict(cfg["data"]["gen"])
     variants = args.variants or e["variants"]
@@ -104,7 +112,7 @@ def main():
                 vprobs = make_test_set(gcfg, cfg["data"]["op_test_id"], e.get("calib_n", 256), cfg["seed"] + 3000017, tok)
                 calib = calibrate_tau_err(rev, vprobs, tok, device, cfg["revision"]["window"], amp,
                                           e.get("calib_false_per_problem", 0.5),
-                                          max_sol_len=max_len, batch_size=e["batch_size"])
+                                          max_sol_len=max_len, batch_size=e["batch_size"], writer=writer)
                 with open(cpath, "w") as f:
                     json.dump(calib, f, indent=2)
                 print(f"calibrated error threshold: {calib}", flush=True)
@@ -147,9 +155,10 @@ def main():
         plain_flops = sum(r["flops"] for r in plain_res) / len(plain_res)
         summary[set_name]["plain"] = summarize(plain_res, plain_flops)
 
-        for v in variants:
-            if v == "plain":
-                continue
+        jobs = [(v, v, {}) for v in variants if v != "plain" and not (frozen and v == "revision_model_no_revision")]
+        jobs += [(v, f"{v}@oracledetect", {"detect": "oracle", "oracle_delay": e.get("oracle_delay", 24)})
+                 for v in e.get("oracle_detect_variants") or [] if v != "plain"]
+        for v, tag, extra in jobs:
             if rev is None:
                 if rank == 0:
                     print(f"no revision model found at {rev_path}; skipping {v}")
@@ -159,18 +168,18 @@ def main():
                                   "slack_min_len": cfg["revision"]["slack_min_len"],
                                   "confdrop_delta": cfg["revision"]["confdrop_delta"],
                                   "confdrop_iters": cfg["revision"]["confdrop_iters"],
-                                  "confdrop_mode": cfg["revision"].get("confdrop_mode", "writer")})
-            res = run(v, lambda: decode_revision(rev, mine, pol, tok, device, e["batch_size"], amp,
-                                                 seed=cfg["seed"], n_params=N))
-            summary[set_name][v] = summarize(res, plain_flops)
+                                  "confdrop_mode": cfg["revision"].get("confdrop_mode", "writer"), **extra})
+            res = run(tag, lambda: decode_revision(rev, mine, pol, tok, device, e["batch_size"], amp,
+                                                   seed=cfg["seed"], n_params=N, writer=writer))
+            summary[set_name][tag] = summarize(res, plain_flops)
 
             for mf in e.get("sweep_max_fixes") or []:
                 if v in ("revision_model_no_revision",):
                     continue
                 pol_s = make_policy(v, {**vars(pol), "max_fixes": mf})
-                res = run(f"{v}@maxfix{mf}", lambda: decode_revision(rev, mine, pol_s, tok, device, e["batch_size"],
-                                                                     amp, seed=cfg["seed"], n_params=N))
-                summary[set_name][f"{v}@maxfix{mf}"] = summarize(res, plain_flops)
+                res = run(f"{tag}@maxfix{mf}", lambda: decode_revision(rev, mine, pol_s, tok, device, e["batch_size"],
+                                                                       amp, seed=cfg["seed"], n_params=N, writer=writer))
+                summary[set_name][f"{tag}@maxfix{mf}"] = summarize(res, plain_flops)
 
         # compute-matched baseline: plain model + majority vote
         k = e.get("majority_k", "auto")

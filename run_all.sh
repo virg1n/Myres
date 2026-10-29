@@ -43,11 +43,19 @@ launch() {
   fi
 }
 
+FROZEN=$("$PY" -c "import sys; from revise.utils import load_config; print(int(bool(load_config(sys.argv[1], sys.argv[2:])['revision'].get('frozen_writer'))))" "$CONFIG" ${OVERRIDES[@]+"${OVERRIDES[@]}"})
+
 {
-  echo "=== [1/4] plain model ($(date)) ==="
-  launch revise.train --config "$CONFIG" --stage plain ${OVERRIDES[@]+"${OVERRIDES[@]}"}
-  echo "=== [2/4] revision model ($(date)) ==="
-  launch revise.train --config "$CONFIG" --stage revise ${OVERRIDES[@]+"${OVERRIDES[@]}"}
+  if [[ "$FROZEN" == "1" ]]; then
+    # frozen writer: an existing plain model writes, only a separate reviser is trained
+    echo "=== [1-2/4] reviser for a frozen writer ($(date)) ==="
+    launch revise.train --config "$CONFIG" --stage reviser ${OVERRIDES[@]+"${OVERRIDES[@]}"}
+  else
+    echo "=== [1/4] plain model ($(date)) ==="
+    launch revise.train --config "$CONFIG" --stage plain ${OVERRIDES[@]+"${OVERRIDES[@]}"}
+    echo "=== [2/4] revision model ($(date)) ==="
+    launch revise.train --config "$CONFIG" --stage revise ${OVERRIDES[@]+"${OVERRIDES[@]}"}
+  fi
   echo "=== [3/4] evaluation ($(date)) ==="
   launch revise.evaluate --config "$CONFIG" ${OVERRIDES[@]+"${OVERRIDES[@]}"}
   echo "=== [4/4] report ($(date)) ==="

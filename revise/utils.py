@@ -42,6 +42,8 @@ DEFAULTS = {
         "rollout_max_new": 600, "buffer_size": 30000, "min_buffer": 512,
         "num_workers": 6, "log_every": 50, "save_every": 1000, "eval_every": 2000, "eval_n": 256, "eval_revision_n": 64,
         "amp": "bf16", "compile": False, "max_hours": 1000,
+        # frozen-writer setup (stage "reviser"): the plain model writes, a separate copy revises
+        "reviser_steps": 6000, "reviser_lr": 3.0e-4, "reviser_min_lr": 3.0e-5, "reviser_warmup_frac": 0.03,
     },
     "eval": {
         "n_test": 1000, "batch_size": 128, "plain_batch_size": 256,
@@ -51,6 +53,8 @@ DEFAULTS = {
                    "diagnostics": True},
         "calib_n": 256, "calib_false_per_problem": 0.5,
         "sweep_max_fixes": [],
+        # the same erasure variants with oracle error detection (true first error, fixed after a delay)
+        "oracle_detect_variants": [], "oracle_delay": 24,
         "majority_k": "auto", "majority_k_max": 32, "majority_temp": 0.7,
     },
 }
@@ -65,10 +69,21 @@ def deep_update(d, u):
     return d
 
 
+def _read_yaml(path):
+    """YAML config; a `base: other.yaml` key inherits from another config."""
+    with open(path) as f:
+        d = yaml.safe_load(f) or {}
+    base = d.pop("base", None)
+    if base:
+        b = _read_yaml(base if os.path.isabs(base) or os.path.exists(base)
+                       else os.path.join(os.path.dirname(path), os.path.basename(base)))
+        d = deep_update(b, d)
+    return d
+
+
 def load_config(path, overrides=()):
     cfg = copy.deepcopy(DEFAULTS)
-    with open(path) as f:
-        deep_update(cfg, yaml.safe_load(f) or {})
+    deep_update(cfg, _read_yaml(path))
     for o in overrides:
         key, val = o.split("=", 1)
         d = cfg

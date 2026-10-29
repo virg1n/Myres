@@ -20,6 +20,20 @@ LABELS = {
 }
 
 
+def label(k):
+    base, *suf = k.split("@")
+    name = LABELS.get(base, base)
+    for x in suf:
+        name += " [oracle detection]" if x == "oracledetect" else f" [{x}]"
+    return name
+
+
+def _order(rows):
+    keys = [k for k in LABELS if k in rows]
+    keys += [k + "@oracledetect" for k in LABELS if k + "@oracledetect" in rows]
+    return keys + sorted(k for k in rows if k not in keys)
+
+
 def _pct(x):
     return "-" if x is None else f"{100 * x:.1f}"
 
@@ -37,9 +51,16 @@ def write_report(cfg):
                  f"window={cfg['revision']['window']} tokens; dep target={cfg['revision']['dep_target']}; "
                  f"max fixes/problem={cfg['eval']['policy']['max_fixes']}.")
     summary = dict(summary)
-    lines.append("All revision variants share one model (trained at the same FLOPs as the plain model); they differ "
-                 "only in what is erased after a fix. FLOPs are per problem, relative to plain greedy decoding, "
-                 "counted as if the unchanged prefix were KV-cached.")
+    if cfg["revision"].get("frozen_writer"):
+        lines.append("Frozen writer: every variant writes with the same plain model; a separately trained reviser "
+                     "(initialised from it) detects, fixes, erases and fills. Variants differ only in revision.")
+    else:
+        lines.append("All revision variants share one model (trained at the same FLOPs as the plain model); they "
+                     "differ only in what is erased after a fix.")
+    lines.append("FLOPs are per problem, relative to plain greedy decoding, counted as if the unchanged prefix were "
+                 "KV-cached. *[oracle detection]*: the checker finds the true first error and it is fixed with the "
+                 f"correct token {cfg['eval'].get('oracle_delay', 24)} tokens after it was written; the erasure "
+                 "policy then decides what else to erase. This isolates erasure from error detection.")
     calib = summary.pop("calibration", None)
     if calib:
         lines.append(f"Error threshold calibrated on {calib['n_pos_windows'] + calib['n_neg_windows']} windows of the "
@@ -51,17 +72,17 @@ def write_report(cfg):
         ops = {"id": cfg["data"]["op_test_id"], "ood": cfg["data"]["op_test_ood"]}[set_name]
         lines.append(f"## Test set: {set_name.upper()} (op {ops[0]}-{ops[1]}, n={next(iter(rows.values()))['n']})")
         lines.append("")
-        lines.append("| variant | acc % | ± | fully correct % | FLOPs ×plain | passes | fixes | erased/fix | "
+        lines.append("| variant | acc % | ± | fully correct % | FLOPs ×plain | passes | fixes | lag | erased/fix | "
                      "fix prec % | erase prec % | erase rec % |")
-        lines.append("|---|---|---|---|---|---|---|---|---|---|---|")
-        order = [k for k in LABELS if k in rows] + sorted(k for k in rows if k not in LABELS)
+        lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|")
+        order = _order(rows)
         for k in order:
             s = rows[k]
             lines.append(
-                f"| {LABELS.get(k, k)} | {_pct(s['acc'])} | {_pct(s['acc_se'])} | {_pct(s['sol_correct'])} | "
-                f"{_f(s.get('flops_x_plain'))} | {_f(s['steps'], 0)} | {_f(s['fixes'])} | {_f(s['erased_per_fix'], 1)} | "
-                f"{_pct(s.get('fix_precision'))} | {_pct(s.get('erase_precision_vs_true_deps'))} | "
-                f"{_pct(s.get('erase_recall_vs_true_deps'))} |")
+                f"| {label(k)} | {_pct(s['acc'])} | {_pct(s['acc_se'])} | {_pct(s['sol_correct'])} | "
+                f"{_f(s.get('flops_x_plain'))} | {_f(s['steps'], 0)} | {_f(s['fixes'])} | {_f(s.get('lag_per_fix'), 1)} | "
+                f"{_f(s['erased_per_fix'], 1)} | {_pct(s.get('fix_precision'))} | "
+                f"{_pct(s.get('erase_precision_vs_true_deps'))} | {_pct(s.get('erase_recall_vs_true_deps'))} |")
         lines.append("")
         lines.append("Accuracy by number of operations:")
         lines.append("")
@@ -72,10 +93,11 @@ def write_report(cfg):
             if "@maxfix" in k:
                 continue
             a = rows[k]["acc_by_op"]
-            lines.append(f"| {LABELS.get(k, k)} | " + " | ".join(_pct(a.get(str(o))) for o in all_ops) + " |")
+            lines.append(f"| {label(k)} | " + " | ".join(_pct(a.get(str(o))) for o in all_ops) + " |")
         lines.append("")
     lines += [
-        "Columns: *fix prec* = share of fixes made at a token the checker labels as a root error; "
+        "Columns: *lag* = tokens written after the error before it was fixed; "
+        "*fix prec* = share of fixes made at a token the checker labels as a root error; "
         "*erase prec / rec* = overlap of the erased tokens with the true dependents of the fixed token "
         "(generator dependency graph).",
         "",
@@ -98,7 +120,7 @@ def _plot(summary, out_dir):
     for ax, (set_name, rows) in zip(axes[0], summary.items()):
         groups = {}
         for k, s in rows.items():
-            base = k.split("@")[0]
+            base = k.split("@maxfix")[0]
             if s.get("flops_x_plain") is None:
                 continue
             groups.setdefault(base, []).append((s["flops_x_plain"], s["acc"]))
@@ -106,7 +128,7 @@ def _plot(summary, out_dir):
         for base in order:
             pts = groups[base]
             pts.sort()
-            ax.plot([p[0] for p in pts], [100 * p[1] for p in pts], marker="o", label=LABELS.get(base, base))
+            ax.plot([p[0] for p in pts], [100 * p[1] for p in pts], marker="o", label=label(base))
         ax.set_xscale("log")
         ax.set_xlabel("inference FLOPs (× plain greedy)")
         ax.set_ylabel("accuracy %")
