@@ -1,5 +1,3 @@
-torch>=2.2
+torch>=2.4
 numpy
-pyyaml
-matplotlib  # optional, for the plot
-pytest      # optional, for tests
+matplotlib

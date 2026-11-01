@@ -1,170 +1,227 @@
-# Revise and erase only what depends on the error
+# Пилот: seed-режимы для перекрёстной проверки (iGSM-подобные задачи)
 
-A language model that writes left to right, keeps its last few lines in a **window**, re-reads that window with
-context on both sides, and at every step either **writes** the next token or **fixes** one token inside the
-window. After a fix it erases **only the text that depended on the error** and regenerates it.
-Tested on iGSM (synthetic grade-school math with a known dependency graph), against six alternatives at equal
-training compute.
+Проверяем гипотезу: если обучить одну модель с «режимами» z (4 фиксированных кода или непрерывный z)
+и winner-takes-all, то режим j находит ошибки режима i лучше, чем режим i сам, и итоговая
+точность «решение + проверка» растёт при сопоставимом pass@1 и равном бюджете.
 
-## Quick start
+## Запуск (одна команда)
 
 ```bash
-pip install -r requirements.txt
-bash run_all.sh configs/tiny.yaml     # smoke test: whole pipeline in a few minutes (numbers meaningless)
-bash run_all.sh                       # pilot: configs/small.yaml on all visible GPUs (~1.5-2.5 h on 4 GPUs)
-bash run_all.sh configs/base.yaml     # GPT-2-small sized model as in the iGSM papers (~10-14 h)
+pip install -r requirements.txt     # нужен torch с CUDA
+bash run_pilot.sh                   # бюджет 11 часов от старта
 ```
 
-`run_all.sh` trains the plain model, trains the revision model at the same FLOPs, evaluates all variants and
-writes `runs/<name>/results/results.md` (+ `acc_vs_compute.png`). Every stage is skipped if already finished,
-so re-running the command resumes. Overrides go after the config:
-`bash run_all.sh configs/small.yaml train.plain_steps=40000 eval.n_test=2000`. Set `NGPU=` to choose the
-number of GPUs.
+- Сначала на переднем плане идёт **предполётная проверка** (5–10 минут): по крошечной версии каждой задачи
+  (обучение всех типов, сбор ошибок, этап 2, оценка, шум, отчёт). Если она упала, ночь не тратится:
+  смотрите `runs/pilot/logs/pf_*.log`.
+- Потом основной прогон уходит в фон (`nohup`), терминал можно закрыть.
+- Утром: **`runs/pilot/report.md`** (+ `R_matrix_*.png`, `pass_at_k_*.png`, `summary.json`).
 
-**Storage.** Problems are generated on the fly by CPU workers: nothing is downloaded and no dataset is
-stored. Only checkpoints (small: ~50 MB each, base: ~0.35 GB; at most 4 kept) and results are written. Every
-checkpoint save checks `disk_limit_gb` (35 GB) for the run directory and stops with a clear error instead of
-filling the disk.
+Полезное:
 
-**What to watch in the logs** (`runs/<name>/{plain,revise}/log.jsonl`): `eval_greedy_acc` (if the plain
-model stays near 0, train longer or use a bigger model), `rollout_err_rate` (how often the model's own
-solutions contain a mistake), `err_recall` / `err_fp_rate` (error detection), `fix_acc`, `dep_prec` / `dep_rec`
-(dependency head vs. its targets), and in the revision stage `eval_dep_head_acc` vs.
-`eval_same_problems_greedy_acc` (the method vs. plain decoding of the same model on 64 problems).
+```bash
+cat runs/pilot/STATUS.md            # что сейчас идёт, сколько осталось
+tail -f runs/pilot/run_all.log      # общий лог
+tail -f runs/pilot/logs/train_C_fix.log
+kill $(cat runs/pilot/run_all.pid)  # остановить всё
+bash run_pilot.sh                   # та же команда продолжает с места остановки
+```
 
-## The seven variants
+Другой бюджет времени: `bash run_pilot.sh 9`. Дополнительные флаги передаются в `pilot.run_all`,
+например `bash run_pilot.sh 11 --op_max 12` (пропустить подбор сложности) или `--tokens 2e9`.
 
-All revision variants use **one** trained revision model and differ only in what is erased after a fix.
+## Диск (лимит 40 ГБ)
 
-| # | name in code | after fixing token *j* |
+Данные **не хранятся**: задачи генерируются на лету в воркерах DataLoader (~1 мс на задачу,
+10 воркеров на GPU), поэтому цикл «шард → обучение → удалить» не нужен. На диске только
+чекпоинты (~90 МБ на модель, промежуточный `last.pt` ~270 МБ удаляется в конце), массивы оценки
+и логи — ожидаемо 2–4 ГБ. Оркестратор не запускает новые задачи, если папка прогона подходит к 38 ГБ.
+
+## Что происходит за ночь
+
+| фаза | что | GPU |
 |---|---|---|
-| 1 | `plain` | no revision (separately trained plain LM, same training FLOPs) |
-| 2 | `fix_only` | keep everything after *j* |
-| 3 | `erase_suffix` | erase everything after *j*, rewrite |
-| 4 | `dep_head` | erase tokens the dependency head predicts depend on *j* **(the method)** |
-| 5 | `oracle_dep` | erase the true dependents of *j* from the generator's graph (upper bound) |
-| 6 | `dep_head_lines` | as 4, but erase every solution line that contains a dependent token |
-| 7 | `random_erase` | erase as many random tokens after *j* as variant 4 would |
-| 4b | `confdrop_measure` | as 4, but measure the confidence drop with extra forward passes instead of the head |
-| – | `revision_model_no_revision` | diagnostic: the revision model decoding without revising |
-| – | `plain_majority@k` | plain model + majority vote over *k* samples, *k* chosen to match the FLOPs of variant 4 |
+| preflight | крошечные версии всех задач | ~5–10 мин |
+| калибровка | 4 коротких baseline (op_max = 6, 9, 12, 15; 0.25B токенов) → выбирается op_max, где точность ≈ 0.5; замер скорости обучения, WTA и генерации | ~30–40 мин |
+| план | максимальный бюджет T (0.5–3B токенов), при котором симуляция расписания укладывается в оставшееся время | — |
+| этап 1 | A, A′ (равные FLOPs), C_fix, C_cont, D_fix, D_cont — одинаковая инициализация и порядок данных | основная часть |
+| ошибки | A (финал и чекпоинт на 1/3) решает отдельный пул задач → естественные ошибки | ~10 мин |
+| этап 2 | C_fix2, C_fix2u, C_cont2, A_RFT — WTA по правильности собственных решений | ~1 ч каждая |
+| оценка | 12 методов (вкл. B_fix / B_cont — шум в весах A), ID и OOD по 2000 задач | ~10–20 мин каждая |
+| отчёт | report.md с вердиктом по заранее зафиксированному критерию | — |
 
-The report lists accuracy (± standard error), fully-correct-solution rate, inference FLOPs relative to plain
-decoding, fixes per problem, erased tokens per fix, and diagnostics computed with the generator's ground truth:
-how often a fix hits a real error, and the precision and recall of the erased set against the true
-dependents. These are given for the in-distribution test set (op 10–15) and a harder out-of-distribution set
-(op 16–20), with accuracy broken down by number of operations.
+Задачи раскладываются по 4 GPU по критическому пути; обучение занимает GPU целиком, оценки и
+этап 2 (в основном генерация) идут по две на GPU.
 
-## Frozen-writer setup (recommended)
+## Методы
 
-In the first pilot (`configs/small.yaml`), training the revision objective on the shared network degraded the
-writer: 62% vs. 78% for the plain model, even when branching at 90% of training. That hides any effect of
-revision. `configs/small_frozen.yaml` removes this confound:
+| имя | что это |
+|---|---|
+| A | baseline, T токенов |
+| A′ (Aprime) | baseline, T·(1+K/3) токенов — те же FLOPs, что у WTA |
+| B_fix / B_cont | веса A + гауссов шум (4 фиксированных вектора / свежий шум на генерацию), σ и τ подбираются на val |
+| C_fix / C_cont | FiLM-модуляция от z после каждой нормализации + relaxed WTA (K=4) |
+| D_fix / D_cont | то же, но обычный loss со случайным z (контроль: использует ли модель z без WTA) |
+| A_RFT | A + этап 2 без режимов (4 сэмпла, обучение на правильных) — контроль этапа 2 |
+| C_fix2 / C_cont2 | этап 2: побеждают режимы, решившие верно, вес 1/\|W\| (бонус за уникальный успех) |
+| C_fix2u | этап 2 с равными весами 1/K — контроль бонуса |
 
-- **Writer:** an already trained plain model (`revision.writer_path`) writes for every variant, unchanged. Its
-  accuracy is variant 1.
-- **Reviser:** a separate copy of it plus the error/fix/dependency heads, trained for `train.reviser_steps` on the
-  writer's own mistakes. Confidence-drop labels are measured with the frozen writer. Its training FLOPs are
-  logged as `reviser_flops_x_plain_training`.
-- **Oracle detection:** every erasure policy is also evaluated with oracle error detection (`@oracledetect` rows):
-  the checker finds the true first error, it is fixed with the correct token `oracle_delay` tokens after it was
-  written, and the policy decides what else to erase. This answers "does erasing only dependents beat erasing
-  everything / nothing?" independently of how well the model detects its own errors.
+## Метрики (раздел «кто кого проверяет»)
+
+- Для каждой задачи каждый режим i даёт решение; каждый режим j проверяет его **в чистом контексте**.
+- Протокол 1: обученный проверяющий читает решение → P(ошибка) и номер первого ошибочного шага.
+  Порог подбирается **отдельно для каждой ячейки (i, j)** так, чтобы FPR ≈ 5% (перекрёстная подгонка по
+  двум половинам задач), поэтому TPR на диагонали и вне её сравнимы.
+- Протокол 2: проверяющий решает сам и сравнивает ответы / значения шагов.
+- Итоговые процедуры: maj@4, голосование, взвешенное самопроверкой / перекрёстной проверкой,
+  «замена ответа при тревоге» (с подсчётом исправленных и испорченных).
+- Только **естественные** ошибки моделей; доверительные интервалы — парный бутстрап по задачам
+  (у всех методов одинаковые тестовые задачи).
+
+Критерий успеха (раздел 1 отчёта): pass@1(X) ≥ pass@1(R) − 0.03; TPR вне диагонали − на диагонали > 0;
+«голосование + перекрёстная проверка» у X лучше «голосования + самопроверки» у базы R того же бюджета
+(для этапа 1 база — A′, для этапа 2 — A_RFT, для шума — A). Оба CI должны исключать 0.
+
+## Задачи
+
+`pilot/igsm.py` — собственный генератор в духе iGSM (не оригинальный код): иерархия из 4 уровней
+(город → здание → помещение → предмет), явные параметры «в каждом A есть N B» (константы или выражения
+через другие параметры), неявные «всего C в каждом A» (сумма произведений по иерархии), арифметика по
+модулю 23, отвлекающие параметры. op — число арифметических операций в нужной части графа.
+Решения в двух стилях: прямой (случайный топологический порядок) и обратный (план «need … : …» от
+вопроса, затем вычисление). Проверочные данные: верные решения и решения с внесённой ошибкой
+(операция, параметр, арифметика, константа, слагаемое суммы), ошибка распространяется дальше.
+Задачи делятся по хешу текста: train / natural / val / test не пересекаются.
+
+## Решения, принятые при реализации (стоит знать при чтении результатов)
+
+- **Балансировка WTA для фиксированных кодов.** Без неё один код выигрывает почти всё с первых шагов
+  (видно в тестах). Поэтому победители назначаются с ёмкостью 1.25·B/K на код в батче (по относительному
+  loss). Отключается `--balance 0` в `pilot.train`.
+- **Relaxed WTA стохастически:** победитель с вероятностью 1−ε, иначе случайный проигравший (тот же
+  ожидаемый градиент, но один проход назад). ε отжигается 0.5 → 0.05 за первые 20% обучения.
+- Loss решения только на токенах решения, loss проверки только на вердикте; loss нормирован на пример.
+- Этап 2 использует естественные ошибки A для проверочных данных у всех вариантов (одинаково).
+- Модель: 12 слоёв, d=384, 6 голов, RoPE, свой словарь (~260 токенов) → 21.3M параметров ядра +
+  1.2M на FiLM.
+
+## Структура
+
+```
+run_pilot.sh            одна команда
+pilot/igsm.py           генератор, решения, внесение ошибок, проверка решений
+pilot/model.py          GPT + FiLM(z), генерация с KV-кешем
+pilot/data.py           данные на лету
+pilot/train.py          этап 1 (base / wta / mean × none / fix / cont), резюмирование
+pilot/collect.py        естественные ошибки
+pilot/stage2.py         этап 2 (WTA по правильности)
+pilot/evaluate.py       оценка, матрица «кто кого проверяет», шум в весах
+pilot/metrics.py        метрики
+pilot/report.py         отчёт
+pilot/run_all.py        оркестратор: preflight → калибровка → план → расписание на GPU → отчёт
+tests/test_pipeline.py  тесты на CPU: генератор/проверка, метрики на синтетическом агенте
+```
+
+Тесты: `python3 -m tests.test_pipeline`.
+
+---
+
+# Фаза 0: Qwen3-1.7B без обучения
+
+Перед обучением режимов на настоящей модели замеряем, что дают простые способы получить разнообразие,
+и собираем данные для фазы 1. Обучения нет: только генерация и оценка.
+
+## Запуск
 
 ```bash
-bash run_all.sh configs/small_frozen.yaml     # needs runs/small_b/plain/final.pt
+pip install --no-cache-dir vllm datasets huggingface_hub    # vLLM ставит свою версию torch
+bash run_phase0.sh
 ```
 
-## How the idea is implemented
+Сначала на переднем плане идёт **пробный прогон** (smoke, 10–15 минут на крошечных размерах): он
+проверяет загрузку датасетов и модели, все задачи и отчёт. Если он упал, смотрите `runs/phase0/smoke/logs/`.
+Потом полный прогон уходит в фон, ожидаемо **1.5–2 часа** с vLLM на 4 GPU. Результат:
+**`runs/phase0/report_phase0.md`**.
 
-**Window and re-reading** (`revise/model.py`). One transformer, two streams packed into one sequence:
-the *writer* stream is a normal causal LM over prompt + solution; the *re-read* stream is a copy of the last
-`window` solution tokens (64 ≈ 3 lines) that attends to the causal prefix before the window and
-bidirectionally to itself. Heads on the re-read stream: `err` (is this token an error?), `fix` (what should be
-here? also used to fill erased tokens), and a small bilinear `dep` head: `dep[j, k]` is the probability that
-token *k* depends on token *j*.
+Без vLLM код сам переключится на HF transformers, но это в несколько раз медленнее.
+Повторный запуск той же команды продолжает с места остановки.
 
-**Decoding** (`revise/decode.py`). One forward pass per step gives both the next-token distribution and the
-window predictions. If the window contains erased tokens, the leftmost one is filled. Otherwise, if some
-token has err > `tau_err` (calibrated, see below) and the fix head also prefers another token there, the most likely error is replaced
-by the fix head's choice. Otherwise the next token is written. Never more than one
-action per step. Because `dep[j, :]` comes out of the same pass that chose *j*, the method needs no extra pass
-to find dependents. Erasure: a dependent run that reaches the end of the text is truncated and rewritten.
-Runs in the middle become `<mask>` tokens and are filled in place (long runs get `slack` extra masks that may be
-filled with `<null>`, so regenerated text can be shorter). A budget (`max_fixes`) caps revisions per problem.
+## Диск
 
-**Finding dependents by confidence drop** (`confdrop_targets` in `revise/train.py`, `_measure_confdrop` in
-`decode.py`). Confidence is the writer's log-probability of each later token given the text before it, on the
-model's own text vs. the same text with the error fixed; a drop above `confdrop_delta` (2 nats) marks the
-token as dependent. A single comparison misses indirect dependents: in `q = p + 2 = 7 + 2 = 9`, after fixing p's
-value the `7` loses confidence but the `9` is still consistent with `7 + 2`. So the dependents found are replaced
-by what the model would now write, and the measurement is repeated (up to `confdrop_iters` passes) until nothing
-new drops. These measured labels are the training target of the dependency head (`revision.dep_target:
-confdrop`); `dep_target: oracle` trains it on the generator's graph instead. (`confdrop_mode: reread` uses the
-re-read fix head as the confidence instead. That head sees the token it scores, so it learns "the visible token
-is fine" and barely reacts to an earlier fix: in a test run it produced no dependents at all.)
-`tests/test_confdrop.py` checks the measurement with a scripted, perfectly consistent writer. It must find
-every token that changes and never flag a token outside the true dependency graph.
+| что | сколько |
+|---|---|
+| модель Qwen3-1.7B (кеш Hugging Face) | ~4 ГБ, один раз |
+| датасеты (GSM8K, GSM-Symbolic, MATH) | ~0.2 ГБ, один раз |
+| копия модели с шумом | ~4 ГБ, **временно**: одна копия за раз, удаляется сразу после использования |
+| результаты (решения, проверки, сжато) | < 0.5 ГБ |
+| установка vLLM (если ещё нет) | несколько ГБ: тянет свою версию torch и CUDA-библиотек; `--no-cache-dir` не держит копию в кеше pip |
 
-**Error threshold.** Errors are rare among window tokens, so the error head's probabilities are low and a fixed
-0.5 threshold may never fire. With `eval.policy.tau_err: auto` the threshold is calibrated on the model's own
-greedy solutions to 256 held-out problems (different seed from the test sets). It is set so that about
-`calib_false_per_problem` (0.5) false fixes per solution are expected on text that has no error yet. The same
-threshold is used for every variant; the detection recall at that threshold is printed in the report.
+Нужно примерно 9 ГБ свободного места помимо окружения. Дорожка с шумом остановится сама, если свободно
+меньше 6 ГБ (`--min_free_gb`). Если места мало, можно удалить старые чекпоинты пилота:
+`runs/pilot/train/*/final.pt` и `runs/pilot/stage2/*/final.pt` (отчёт пилота при этом сохранится).
 
-**Training** (`revise/train.py`).
-1. *Plain stage:* causal LM on correct solutions. Its FLOPs define the budget; the checkpoint at 50 % is saved.
-2. *Revision stage:* starts from that checkpoint and spends the remaining 50 % of the FLOPs. Rollouts and
-   confidence-drop passes are counted too, so the total compute equals the plain model's. Each batch mixes:
-   - **correct solutions**: LM loss, plus re-read windows with no errors;
-   - **masked gaps**: windows of correct solutions in which dependency-shaped, span, line or random token sets
-     are masked;
-   - **the model's own errors**: every 50 steps each GPU generates 256 solutions (greedy and sampled), the
-     checker finds the first mistake, and windows containing it (detected right away or up to a window later)
-     train the error head, the fix head (target = set of valid tokens) and the dependency row of the mistake.
-   - The learning-rate schedule is a function of the fraction of the compute budget used, so both models follow
-     the same schedule.
+## Что делается
 
-**iGSM** (`revise/igsm/`). A re-implementation of the iGSM generator (Ye et al., *Physics of Language Models
-2.1*, 2024) rather than the official code: a 4-layer structure graph of items, instance parameters (edges),
-abstract parameters (category totals as sums of products), and a random dependency graph. Arithmetic is
-mod 23, problem sentences are shuffled and include distractors, and solutions compute only the necessary
-parameters in a random topological order with temporary variables, e.g.
-`Define Film Studio 's School Daypack as g ; R = W + B = 13 + 7 = 20 ; so g = R + 12 = 20 + 12 = 9 .`
-A closed word-level vocabulary (362 tokens) is used. `checker.py` labels any (partial, model-written) solution
-token by token, with *consistency* semantics: a value correctly computed from an earlier wrong value is not a
-new error, it depends on it. It also gives the set of valid tokens at each error and the token-level
-information-flow graph: which value was computed from which operands, which formula belongs to which
-parameter, and which letter refers to which definition. That graph drives the oracle (variant 5) and the
-erase precision/recall diagnostics.
+Тест (~1500 задач): GSM-Symbolic P1/P2 (новые варианты шаблонов GSM8K), MATH уровней 3–4 с числовыми
+ответами, синтетика на отложенных шаблонах. Модель в режиме без thinking, τ = 0.7, top-p = 0.8, top-k = 20.
 
-## Compute accounting and caveats
+| метод | режимы | проверяющий j |
+|---|---|---|
+| temperature | 4 сэмпла нейтрального промпта (+4 вторых сэмпла) | один нейтральный |
+| strategies | 4 системных промпта: вперёд, с конца, через уравнения, с проверкой | «проверяющий по стратегии j» |
+| noise | 4 копии весов с гауссовым шумом (σ подбирается на val: не больше −3 п. точности) | копия j |
 
-- **Training compute** is matched exactly in FLOPs (6·N per trained token, 2·N per inference token for
-  rollouts and confidence-drop passes).
-- **Inference compute** is reported per problem as if the unchanged prefix were KV-cached. Re-reading a
-  64-token window at every step costs roughly 30× a plain greedy decode for these problem sizes. This is why
-  `plain_majority@k` at matched FLOPs is included, and why `eval.policy.check_every` (re-read every k steps) and
-  `eval.sweep_max_fixes` (accuracy-vs-compute curves) exist.
-- The current decoder recomputes the full forward pass at every step (simple and exact), so wall-clock time is
-  higher than the FLOP numbers suggest.
-- Computing an unnecessary parameter counts as an error (`data.strict_necessary: true`).
-- Length-changing regeneration in the middle of the text is limited by `revision.slack`.
+Проверка: модель отвечает Yes/No, берём P(No). Порог для каждой пары (решающий, проверяющий) подбирается
+на FPR ≈ 5%. Второй протокол — «реши сам и сравни ответы»; на диагонали это второй сэмпл того же режима
+(контроль «просто свежая попытка»).
 
-## Layout
+Пул (~12k задач из GSM8K train, MATH train, синтетики): 4 стратегии × 2 решения. Верные решения пойдут
+эталонами в multi-reference WTA, неверные — естественными ошибками для обучения проверяющего.
 
+## Пороги (зафиксированы заранее, раздел 1 отчёта)
+
+1. Промпты снижают φ ошибок или долю одинаковых неверных ответов меньше чем на 0.05 → есть что улучшать.
+2. AUROC проверяющего по промпту < 0.6 → в фазе 1 нужен обученный проверяющий.
+3. Задач, где верна ровно одна стратегия, < 5% → для этапа 2 нужны задачи потруднее.
+4. pass@1 источника вне [0.3, 0.85] → сменить задачи этого источника.
+5. Промпты значимо улучшают итоговую точность → сравнивать фазу 1 с ними.
+
+Пороги — в `phase0/report.py` (`TH`). Тесты на CPU: `python3 -m tests.test_phase0_report`.
+
+---
+
+# Фаза 1: обученные режимы на Qwen3-1.7B
+
+Нужна готовая фаза 0 в `runs/phase0` (из неё берутся тест, пул и базовые методы).
+
+```bash
+bash run_phase1.sh            # пробный прогон (~30–40 мин) на переднем плане, потом полный (~8.5–10 ч) в фоне
+HOURS=13 bash run_phase1.sh   # бюджет времени полного прогона (по умолчанию 12 ч)
 ```
-run_all.sh                 one command: train plain -> train revision -> evaluate -> report
-configs/{tiny,small,small_frozen,base}.yaml
-revise/igsm/generator.py   iGSM-style generator (dependency graph, values, problem/solution text)
-revise/igsm/checker.py     labeller: root errors, valid fixes, token dependency DAG, final answer
-revise/model.py            two-stream transformer, attention mask, heads, KV cache
-revise/examples.py         training examples (clean / masked / own-error windows), erasure, collate
-revise/data.py             on-the-fly problem generation workers
-revise/rollout.py          KV-cached generation, rollout buffer of the model's own mistakes
-revise/train.py            DDP training, FLOP budget, losses, confidence-drop labels
-revise/decode.py           revision decoding and all variants
-revise/evaluate.py         distributed evaluation, summaries
-revise/report.py           results.md and plot
-tests/                     python -m pytest -q tests
-```
+
+Статус: `cat runs/phase1/STATUS.md`. Отчёт: **`runs/phase1/report_phase1.md`**. Повторный запуск продолжает
+с места остановки, обучение — с последнего чекпоинта.
+
+## Что делается
+
+| шаг | что |
+|---|---|
+| hard_prep, hard_gen ×4 | задачи потруднее: из пула фазы 0 — решённые ≤ 6 из 8 (ещё 8 решений), MATH train уровня 5, синтетика на 6–10 шагов |
+| build | эталоны: правильные решения, сгруппированные по структуре (набор чисел, Жаккар ≥ 0.8), не больше 4 на задачу; 6000 примеров для проверяющего Yes/No (половина — естественные ошибки); отложенный val (600 задач, не участвуют в обучении); набор для этапа 2 (успех базовой модели 10–80%) |
+| train ×6 | LoRA r=32 + FiLM (только масштаб, 4 кода) на всех вариантах: `sft1`, `sftmulti`, `filmmean`, `wta1`, `wtamulti`, `wtabal`. **Каждый обучается ровно 2 часа** (≈ равный compute): данные повторяются в новом порядке, пока не кончится время; расписание LR привязано ко времени. Loss = loss решений + 0.4 × loss проверки, каждый нормирован отдельно |
+| eval ×6 | каждый режим экспортируется в обычный чекпоинт Qwen3 (LoRA слита, FiLM вшит в веса RMSNorm) → vLLM: val и тест по 2 решения на режим + матрица проверки Yes/No |
+| select | на val, по правилу из фазы 1: наименьшая корреляция ошибок среди вариантов с pass@1 ≥ sftmulti − 0.02 |
+| stage2 ×2 | лучший вариант и контроль `sftmulti`: 2 раунда «режимы решают → обучение на своих правильных решениях с весом 1/\|W\|» (для контроля — обычный RFT); логируется доля задач, решённых ровно одним режимом |
+| noise2 | шум в весах с σ ∈ {0.05, 0.1, 0.2} (в фазе 0 до порчи точности не дошли) |
+| report | все методы на тех же 1500 задачах теста фазы 0, парный бутстрап |
+
+## Диск
+
+Экспортированные режимы — по ~3.5 ГБ, хранятся только во время оценки одной модели и сразу удаляются.
+Пик при 4 одновременных оценках ~60 ГБ (если свободно меньше 60 ГБ, режимы экспортируются по одному).
+Адаптеры LoRA + FiLM — ~150 МБ на вариант.
+
+## Проверено на CPU
+
+`python3 -m tests.test_phase1_export`: экспортированный режим k даёт те же логиты, что обучаемая модель с
+кодом k (расхождение ~1e-6 в float32). Весь конвейер фазы 1 прогнан на крошечной случайной Qwen3.
