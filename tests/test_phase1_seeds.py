@@ -4,11 +4,15 @@
 
 1. separate adapters: a mixed batch equals single-mode batches, every exported mode equals training
 2. report: known numbers, pairing (identical methods give exactly zero), seed 0 from phase 1
+   rejected files (ids out of order, wrong number of verifier scores), direct pairs with the near methods
 3. plan of the full run: all jobs, the simulated time
-4. the --smoke run end to end through the real job runner (train, evaluate on the HF backend, report)"""
+4. schedule by the tokens of another run; ModC data refuses a gap in the pools
+5. the --smoke run end to end through the real job runner (train, evaluate on the HF backend, report)
+6. resuming that run long after its start: new deadline, report rebuilt with the new results"""
 import gzip
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -19,6 +23,7 @@ import torch
 from phase0 import prompts
 from phase1 import film as FM
 from phase1 import seeds_report
+from phase1.metrics import load_eval
 from phase1.train import mcl_weights
 from tests.test_phase1_export import tiny_qwen
 
@@ -174,6 +179,7 @@ def test_report(d):
     d0 = c["wta1-p0_strategies:pass1"]
     assert d0["n"] == 3 and d0["lo"] <= d0["mean"] <= d0["hi"]
     assert c["wta1-sftmulti_eq:pass1"]["n"] == 2, "only common seeds"
+    assert "sftmulti-sftmulti_eq:pass1" in c and "sftmulti_eq-sftmulti:pass1" not in c
     text = open(out, encoding="utf-8").read()
     assert "wtabal seed" not in text and "sftmulti_eq seed 2" in text
     assert "loramcl seed 1" in text, "missing methods are listed"
@@ -189,6 +195,33 @@ def test_report(d):
     for k, _ in seeds_report.METRICS:
         e = seeds_report.compare(pt, rp, "wta1", "wtabal", [(x, x) for x in (0, 1, 2)], k)
         assert e["mean"] == 0 and e["lo"] == 0 and e["hi"] == 0, k
+    # direct pairs with the near methods, for our variants only
+    for s_ in (1, 2):
+        write_modes(os.path.join(run, "eval", f"loramcl_s{s_}"), test, data[s_], np.full((K, 2, N_TEST), 100))
+        write_modes(os.path.join(run, "eval", f"modc_s{s_}"), test, data[s_], np.full((K, 2, N_TEST), 100))
+        write_single(os.path.join(run, "eval", f"sftmodc_s{s_}"), test, rng.random((8, N_TEST)) < 0.5, np.full((8, N_TEST), 100))
+        write_single(os.path.join(run, "eval", f"sft1_eq_s{s_}"), test, rng.random((8, N_TEST)) < 0.5, np.full((8, N_TEST), 100))
+    # a report must refuse results that do not follow the test set instead of mixing up problems
+    f = os.path.join(run, "eval", "wtabal_s2", "solve_1_test.jsonl.gz")
+    rows = [json.loads(l) for l in gzip.open(f, "rt")]
+    write_gz(f, [rows[1], rows[0]] + rows[2:])
+    f = os.path.join(run, "eval", "wta1_s2", "verify_0.json")
+    v = json.load(open(f))
+    json.dump({"p_no": [x[:-1] for x in v["p_no"]], "missing": 0}, open(f, "w"))
+    try:
+        load_eval(os.path.join(run, "eval", "wtabal_s2"), test, "test")
+        raise AssertionError("rows out of order must be rejected")
+    except ValueError as e:
+        assert "solve_1_test" in str(e)
+    out = seeds_report.build(run, os.path.join(p1, "data"), p1, p0, boot=10)
+    c = json.load(open(os.path.join(run, "summary_seeds.json")))["comparisons"]
+    text = open(out, encoding="utf-8").read()
+    assert "wtabal seed 2 (отклонён" in text and "wta1 seed 2 (отклонён" in text
+    for pair in ("wta1-loramcl", "wta1-modc", "wtabal-loramcl", "wtabal-modc", "modc-sftmodc", "wta1-sft1_eq"):
+        assert f"{pair}:pass4" in c, pair
+    assert c["wta1-loramcl:pass1"]["n"] == 1, "wta1 seed 2 was rejected, seed 0 of loramcl does not exist"
+    for pair in ("loramcl-modc", "sftmodc-modc", "wta1-sftmodc", "sft1_eq-sftmulti", "loramcl-wta1"):
+        assert f"{pair}:pass4" not in c, pair
     print("report on fabricated data: ok")
 
 
@@ -234,15 +267,38 @@ def test_plan(d, p0, p1, base):
                        env=ENV, capture_output=True, text=True, check=True)
     out = r.stdout
     print(out.splitlines()[0])
-    assert "30 jobs" in out, out
+    assert "42 jobs" in out, out
     for name in ("train_loramcl_s0", "train_modc_s0", "train_sftmulti_eq_s0", "train_wta1_s1", "train_sftmulti_s2",
-                 "eval_sftmulti_eq_s2", "eval_modc_s0"):
+                 "eval_sftmulti_eq_s2", "eval_modc_s0", "train_sft1_eq_s0", "eval_sft1_eq_s2", "train_sftmodc_s0",
+                 "eval_sftmodc_s1"):
         assert name + ":" in out, name
     for name in ("train_wta1_s0", "train_wtabal_s0", "train_sftmulti_s0", "eval_wta1_s0"):
         assert name + ":" not in out, name
+    assert "train_sft1_eq_s1: est 0.90 h, deps ['train_wta1_s1']" in out, "own seed of wta1"
+    assert "train_sft1_eq_s0: est 0.90 h, deps []" in out, "wta1 of seed 0 comes from phase 1"
     hours = float(out.split("simulated ")[1].split(" h")[0])
     assert hours <= 14, hours
     print("plan of the full run: ok")
+
+
+def test_target_and_gaps(d, p0, p1, base):
+    # the run ends at the tokens of the other run, not at its time limit or at the end of the data
+    ref = os.path.join(d, "ref.json")
+    json.dump({"tokens": 60}, open(ref, "w"))
+    out = os.path.join(d, "target")
+    subprocess.run([sys.executable, "-m", "phase1.train", "--variant", "sft1", "--base", base, "--data", f"{p1}/data",
+                    "--out", out, "--target_tokens_from", ref, "--P", "2", "--seed", "3", "--save_opt", "0"],
+                   env=ENV, check=True, capture_output=True)
+    r = json.load(open(f"{out}/result.json"))
+    assert r["tokens"] >= 60 and r["steps_done"] == 1 and r["seed"] == 3, r
+    # a train problem without a labelled reference is an error, not a silent skip
+    gap = os.path.join(d, "gap")
+    os.makedirs(gap)
+    write_gz(os.path.join(gap, "pool_0.jsonl.gz"), [{"id": "t0", "mode": 0, "texts": ["a"], "answers": ["7"], "correct": [True]}])
+    x = subprocess.run([sys.executable, "-m", "phase1.modc_data", "--data", f"{p1}/data", "--pools", gap, "--out",
+                        os.path.join(d, "gap_out")], env=ENV, capture_output=True, text=True)
+    assert x.returncode != 0 and "1 of 30" in x.stderr, x.stderr
+    print("schedule by tokens, gaps in the pools: ok")
 
 
 def test_smoke(d, p0, p1, base):
@@ -277,8 +333,28 @@ def test_smoke(d, p0, p1, base):
     assert os.path.exists(f"{run}/eval/modc_s1/verify_1.json")
     text = open(f"{run}/report_seeds.md", encoding="utf-8").read()
     print("\n".join(text.splitlines()[:14]))
-    assert "| loramcl (" in text and "| modc (" in text
+    assert "| loramcl (" in text and "| modc (" in text and "| sft1_eq (" in text
+    assert "### Против loramcl" in text and "### Против modc" in text and "### Против sft1_eq" in text
+    assert "wta1-loramcl:pass1" in json.load(open(f"{run}/summary_seeds.json"))["comparisons"]
+    r1 = json.load(open(f"{run}/train/sft1_eq_s1/result.json"))
+    assert r1["tokens"] >= res["wta1_s1"]["tokens"] and r1["seed"] == 1
+    assert os.path.exists(f"{run}/train/sftmodc_s1/DONE")
     print("smoke run end to end: ok")
+
+    # a day later, with an evaluation that was lost: not skipped by the old deadline, report rebuilt
+    sp = f"{run}/state.json"
+    st = json.load(open(sp))
+    st["started"] -= 24 * 3600
+    json.dump(st, open(sp, "w"))
+    assert os.path.exists(f"{run}/report_job/DONE")
+    shutil.rmtree(f"{run}/eval/loramcl_s1")
+    text = text.replace("| loramcl (", "")
+    open(f"{run}/report_seeds.md", "w", encoding="utf-8").write(text)
+    r = subprocess.run(seeds_cmd(run, p0, p1, base, "--smoke", "--max_tokens", "8", "--max_hours", "4"), env=ENV)
+    assert r.returncode == 0
+    assert os.path.exists(f"{run}/eval/loramcl_s1/DONE")
+    assert "| loramcl (" in open(f"{run}/report_seeds.md", encoding="utf-8").read(), "the report must be rebuilt"
+    print("resume after the deadline of the first start: ok")
 
 
 def main():
@@ -288,6 +364,7 @@ def main():
     test_report(d)
     p0, p1 = fake_phases(d)
     test_plan(d, p0, p1, base)
+    test_target_and_gaps(d, p0, p1, base)
     test_smoke(d, p0, p1, base)
     print("all ok")
 

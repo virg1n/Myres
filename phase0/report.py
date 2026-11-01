@@ -30,6 +30,15 @@ def read_gz(path):
         return [json.loads(l) for l in f]
 
 
+def check_ids(rows, test, path):
+    """Results are matched to problems by position: reject a file that does not follow the test set."""
+    got, want = [r["id"] for r in rows], [p["id"] for p in test]
+    if len(set(want)) != len(want):
+        raise ValueError("duplicate problem ids in the test set")
+    if got != want:
+        raise ValueError(f"{os.path.basename(path)}: ids differ from the test set in order or content")
+
+
 def arrays(test, sol, p_no):
     """sol[i][s] -> list over problems of (answer_key, correct, text); p_no[i][j] -> list over problems."""
     M, S, N = len(sol), len(sol[0]), len(test)
@@ -55,6 +64,8 @@ def arrays(test, sol, p_no):
     A["err_pid"] = np.full((M, S, N), -1, np.int64)
     A["backward"] = np.zeros((M, S, N), bool)
     A["p_err"] = np.array(p_no, dtype=float)                  # [I,J,N]
+    if A["p_err"].shape[-1] != N:
+        raise ValueError(f"verifier scores for {A['p_err'].shape[-1]} problems, the test set has {N}")
     A["loc"] = np.zeros((M, M, N), np.int64)
     ans0, ans1 = A["answer"][:, 0], A["answer"][:, 1]
     A["cmp_flag"] = np.zeros((M, M, N), bool)
@@ -73,6 +84,7 @@ def load_methods(run):
     f_neu, f_vn = os.path.join(td, "test_neutral.jsonl.gz"), os.path.join(td, "verify_neutral.json")
     if os.path.exists(f_neu) and os.path.exists(f_vn):
         neu = read_gz(f_neu)
+        check_ids(neu, test, f_neu)
         sol = [[[(r["answers"][i + 4 * s], r["correct"][i + 4 * s], r["texts"][i + 4 * s]) for r in neu]
                 for s in range(2)] for i in range(4)]
         v = json.load(open(f_vn))
@@ -81,7 +93,9 @@ def load_methods(run):
     f_vs = os.path.join(td, "verify_strategies.json")
     if os.path.exists(f_vs):
         st = [read_gz(os.path.join(td, f"test_strategy{k}.jsonl.gz")) for k in range(4)]
-        sol = [[[(r["answers"][s], r["correct"][s], r["texts"][s]) for r in st[i]] for s in range(2)]
+        for rows in st:
+            check_ids(rows, test, "test_strategy")
+        sol =[[[(r["answers"][s], r["correct"][s], r["texts"][s]) for r in st[i]] for s in range(2)]
                for i in range(4)]
         v = json.load(open(f_vs))
         methods["strategies"] = arrays(test, sol, v["p_no"]) + (v["missing"],)
@@ -91,7 +105,9 @@ def load_methods(run):
         k += 1
     if k >= 2 and all(os.path.exists(os.path.join(nd, f"verify_{j}.json")) for j in range(k)):
         so = [read_gz(os.path.join(nd, f"solve_{i}.jsonl.gz")) for i in range(k)]
-        sol = [[[(r["answers"][s], r["correct"][s], r["texts"][s]) for r in so[i]] for s in range(2)]
+        for rows in so:
+            check_ids(rows, test, "noise solve")
+        sol =[[[(r["answers"][s], r["correct"][s], r["texts"][s]) for r in so[i]] for s in range(2)]
                for i in range(k)]
         vs = [json.load(open(os.path.join(nd, f"verify_{j}.json"))) for j in range(k)]
         p = [[vs[j]["p_no"][i] for j in range(k)] for i in range(k)]

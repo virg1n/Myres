@@ -38,13 +38,14 @@ def main():
         refs = per.get(r["id"], {})
         if not refs:
             continue
+        # these texts are not the refs of train.jsonl: their control is the variant sftmodc
         rows.append({"id": r["id"], "source": r["source"], "question": r["question"], "answer": r["answer"],
                      "refs": [{"mode": k, "text": refs[k]} for k in sorted(refs)]})
         hist[len(refs)] += 1
         for k in refs:
             by_mode[k] += 1
-    if not rows:
-        raise SystemExit(f"no labelled references for {len(train)} train problems in {a.pools}")
+    if len(rows) != len(train):       # train.jsonl was built from the same pools: a gap means wrong input
+        raise SystemExit(f"labelled references for {len(rows)} of {len(train)} train problems in {a.pools}")
     with open(os.path.join(a.out, "train.jsonl"), "w") as f:
         for r in rows:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")

@@ -12,11 +12,13 @@ variants (--variant):
   loramcl    LoRA-MCL: K separate adapters, no FiLM, one reference, relaxed WTA (Eq. 5 of the paper):
              every example goes through all K adapters with weight 1-eps for the winner, eps/(K-1) else
   modc       ModC with prefixes: one adapter, "[Mode k]" in the input, reference of strategy k trains mode k
+  sftmodc    no modes, the references of modc without prefixes (control for modc)
 Verification examples (Yes/No) are mixed in for every variant; with modes they use batch WTA
 (loramcl: relaxed WTA as for solutions; modc: a random prefix).
 Training stops at the end of one pass or at --max_hours, the LR schedule follows whichever comes
 first, and a checkpoint is written every --ckpt_minutes (re-running resumes).
---snap_tokens T saves the adapter once T training tokens are reached (optionally stopping there)."""
+--snap_tokens T saves the adapter once T training tokens are reached (optionally stopping there).
+--target_tokens_from result.json: the LR schedule and the end of training follow the tokens of that run."""
 import argparse
 import itertools
 import json
@@ -74,9 +76,9 @@ def make_steps(variant, train, verify, tok, P, ver_ratio, seed, K=4):
                 p, t = encode_solve(tok, r["question"], r["solution"])
                 ex.append(dict(p=p, t=t, group=g, kind="solve", mode=r.get("mode"), w=r.get("w", 1.0)))
                 continue
-            if variant == "modc":
+            if variant in ("modc", "sftmodc"):
                 for ref in r["refs"]:
-                    p, t = encode_solve(tok, r["question"], ref["text"], ref["mode"])
+                    p, t = encode_solve(tok, r["question"], ref["text"], ref["mode"] if variant == "modc" else None)
                     ex.append(dict(p=p, t=t, group=g, kind="solve", mode=ref["mode"], w=1.0))
                 continue
             refs = [r["single"]] if variant in ("sft1", "wta1", "loramcl") else r["refs"]
@@ -211,7 +213,7 @@ def assign(variant, ex, L, K, eps, rng):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--variant", required=True, choices=["sft1", "sftmulti", "filmmean", "wta1", "wtamulti",
-                                                          "wtabal", "fixed", "loramcl", "modc"])
+                                                          "wtabal", "fixed", "loramcl", "modc", "sftmodc"])
     ap.add_argument("--base", required=True)
     ap.add_argument("--data", required=True, help="dir with train.jsonl / verify.jsonl (or --train_file)")
     ap.add_argument("--train_file", default="")
@@ -237,6 +239,7 @@ def main():
     ap.add_argument("--save_opt", type=int, default=1, help="0: adapter.pt without Adam moments (3x smaller)")
     ap.add_argument("--snap_tokens", type=int, default=0, help="save snap/adapter.pt at this many training tokens")
     ap.add_argument("--stop_after_snap", action="store_true", help="stop at --snap_tokens, adapter.pt is the snapshot")
+    ap.add_argument("--target_tokens_from", default="", help="result.json of a run: schedule by its training tokens")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     if os.path.exists(os.path.join(a.out, "DONE")):
@@ -292,6 +295,7 @@ def main():
            "lora_modes": K if mcl else 0, "prefix_modes": K if a.variant == "modc" else 0}
     rng = random.Random(a.seed + st["step"])
     n_tr = sum(p.numel() for p in lora_ps + film_ps)
+    target_tokens = json.load(open(a.target_tokens_from))["tokens"] if a.target_tokens_from else 0
     log(f"{a.variant}: {per_epoch} steps/epoch, {sum(len(s) for s in first)} examples/epoch, trainable {n_tr / 1e6:.1f}M, "
         f"modes {K}, limit {a.max_hours} h")
     t0, t_ck = time.time() - st["elapsed"], time.time()
@@ -300,10 +304,11 @@ def main():
     model.train()
     while st["step"] < total and first and first[0]:
         el = time.time() - t0
-        # LR / eps schedule follow the time budget (or max_steps in smoke runs)
-        prog = max(el / (a.max_hours * 3600), st["step"] / a.max_steps if a.max_steps else 0.0)
+        # LR / eps schedule follow the time budget (or max_steps in smoke runs, or the target tokens)
+        prog = max(el / (a.max_hours * 3600), st["step"] / a.max_steps if a.max_steps else 0.0,
+                   st["tokens"] / target_tokens if target_tokens else 0.0)
         if prog >= 1:
-            log("time limit reached")
+            log("budget reached")
             break
         warm = min(1.0, (st["step"] + 1) / 30)
         mult = warm * (0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * prog)))

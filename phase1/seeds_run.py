@@ -1,13 +1,19 @@
 """Seeds and near methods with one command: no new generation, data of phase 1, resumable.
 
-  variants  wta1, wtabal, sftmulti (2 h each, as in phase 1), loramcl, modc (2 h each),
-            sftmulti_eq = sftmulti at the training tokens of wta1 (a snapshot of the same run)
-  seeds     0, 1, 2; seed 0 of wta1, wtabal, sftmulti is taken from phase 1 as it is, so at seed 0 only
-            loramcl, modc and sftmulti_eq run (the latter stops at the snapshot)
-  flow      modc_data -> train x13 -> eval on test x15 -> report (phase1/seeds_report.py)
+  variants  wta1, wtabal, sftmulti (2 h each, as in phase 1), loramcl, modc, sftmodc (2 h each),
+            sft1_eq = the references of wta1, up to the training tokens of wta1 of the same seed, with its
+            own full LR schedule;
+            sftmulti_eq = sftmulti limited by tokens: a snapshot of the 2-hour run at the tokens of wta1
+            of seed 0 (other examples and an unfinished LR schedule, an additional control only)
+  seeds     0, 1, 2; seed 0 of wta1, wtabal, sftmulti is taken from phase 1 as it is; there sftmulti_eq
+            stops at the snapshot
+  flow      modc_data -> train x19 -> eval on test x21 -> report (phase1/seeds_report.py)
+
+--max_hours counts from the start of this invocation, so a resumed run gets a new deadline; the report
+is rebuilt by every invocation.
 
 Disk: at most one exported checkpoint (3.5 GB) per running evaluation, adapters are saved without Adam
-moments; the peak is ~18-20 GB."""
+moments; the peak is ~19-21 GB."""
 import argparse
 import json
 import os
@@ -17,14 +23,17 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from pilot.common import is_done  # noqa: E402
 from pilot.run_all import Job, Runner, simulate  # noqa: E402
 
 PY = sys.executable
 TRAIN_H = 2.0
+EQ_H = 0.9            # estimate: a run stopped at the tokens of wta1
 OLD = ["wta1", "wtabal", "sftmulti"]
-NEW = ["loramcl", "modc"]
+NEW = ["loramcl", "modc", "sftmodc", "sft1_eq"]
+SINGLE = {"sftmulti", "sftmodc", "sft1_eq", "sftmulti_eq"}
 EVAL_H = {"single": 0.5, "modc": 0.7, "modes": 1.0}
-SMOKE_NO_EVAL = {"wtabal"}
+SMOKE_NO_EVAL = {"wtabal", "sftmodc"}
 
 
 def log(*a):
@@ -39,7 +48,7 @@ def eval_seed(s):
 def train_plan(smoke):
     if smoke:
         return {0: ["sftmulti_eq"], 1: OLD + NEW}
-    return {0: NEW + ["sftmulti_eq"], 1: OLD + NEW, 2: OLD + NEW}
+    return {0: NEW + ["sftmulti_eq"], 1: OLD + NEW, 2: OLD + NEW}      # OLD first: sft1_eq needs wta1 of its seed
 
 
 def eq_adapter(run, s):
@@ -57,16 +66,22 @@ def jobs(a, run, data, model, tokens):
     plan = train_plan(sm)
     for s, variants in plan.items():
         for v in variants:
-            cmd = [PY, "-m", "phase1.train", "--variant", "sftmulti" if v == "sftmulti_eq" else v, "--base", model,
+            variant = {"sftmulti_eq": "sftmulti", "sft1_eq": "sft1"}.get(v, v)
+            cmd = [PY, "-m", "phase1.train", "--variant", variant, "--base", model,
                    "--data", data, "--out", f"{run}/train/{v}_s{s}", "--max_hours", f"{TRAIN_H:.2f}", "--seed", str(s),
                    "--save_opt", "0"] + extra
             deps, est = [], TRAIN_H + 0.1
-            if v == "modc":
+            if v in ("modc", "sftmodc"):
                 cmd += ["--train_file", f"{run}/modc/train.jsonl"]
                 deps = ["modc_data"]
             if v == "sftmulti_eq":
                 cmd += ["--snap_tokens", str(tokens), "--stop_after_snap"]
-                est = 0.7
+                est = EQ_H
+            elif v == "sft1_eq":
+                old = s == 0 and "wta1" not in variants
+                cmd += ["--target_tokens_from", f"{a.phase1}/train/wta1/result.json" if old
+                        else f"{run}/train/wta1_s{s}/result.json"]
+                deps, est = ([] if old else [f"train_wta1_s{s}"]), EQ_H
             elif v == "sftmulti":
                 cmd += ["--snap_tokens", str(tokens)]
             J.append(Job(f"train_{v}_s{s}", cmd, f"{run}/train/{v}_s{s}", deps, weight=2, est=est))
@@ -85,7 +100,7 @@ def jobs(a, run, data, model, tokens):
             if v == "sftmulti_eq":
                 continue
             ev(v, s, f"{run}/train/{v}_s{s}/adapter.pt", f"train_{v}_s{s}",
-               "single" if v == "sftmulti" else "modc" if v == "modc" else "modes")
+               "single" if v in SINGLE else "modc" if v == "modc" else "modes")
         if "sftmulti_eq" in variants or "sftmulti" in variants:
             ev("sftmulti_eq", s, *eq_adapter(run, s), "single")
     J.append(Job("report", [PY, "-m", "phase1.seeds_report", "--run", run, "--data", data,
@@ -96,7 +111,7 @@ def jobs(a, run, data, model, tokens):
 
 
 def check_inputs(a):
-    """Everything taken from the earlier phases; (missing paths, tokens of wta1 at seed 0)."""
+    """Paths taken from the earlier phases that do not exist."""
     need = [f"{a.phase1}/data/{f}.jsonl" for f in ("train", "verify", "test")] + \
            [f"{a.phase1}/train/wta1/result.json", f"{a.phase0}/test/verify_strategies.json",
             f"{a.phase0}/test/verify_neutral.json", f"{a.phase0}/pool", f"{a.phase1}/hard/out"] + \
@@ -123,7 +138,8 @@ def main():
     ap.add_argument("--model", default="")
     ap.add_argument("--gpus", default="0,1,2,3")
     ap.add_argument("--hours", type=float, default=14.0, help="planned time; only a warning if the plan exceeds it")
-    ap.add_argument("--max_hours", type=float, default=16.0, help="jobs that would end later are skipped")
+    ap.add_argument("--max_hours", type=float, default=16.0,
+                    help="from the start of this invocation: jobs that would end later are skipped")
     ap.add_argument("--max_tokens", type=int, default=1200)
     ap.add_argument("--smoke", action="store_true")
     ap.add_argument("--plan_only", action="store_true", help="print the jobs and the simulated time, run nothing")
@@ -156,9 +172,12 @@ def main():
                 log(f"WARNING: wta1 of phase 1 had a limit of {ref['time_limit_h']} h, here {TRAIN_H} h")
     data = smoke_data(a, run) if a.smoke else os.path.join(a.phase1, "data")
     J = jobs(a, run, data, model, state["eq_tokens"])
+    for j in J:
+        if is_done(j.out):         # the plan of a resumed run counts what is left
+            j.est = 0.0
     mk = simulate(J, gpus)
     free = shutil.disk_usage(run).free / 1e9
-    log(f"{len(J)} jobs, simulated {mk:.1f} h on {len(gpus)} GPUs (budget {a.hours} h, hard limit {a.max_hours} h); "
+    log(f"{len(J)} jobs, simulated {mk:.1f} h left on {len(gpus)} GPUs (budget {a.hours} h, hard limit {a.max_hours} h); "
         f"eq tokens {state['eq_tokens'] / 1e6:.1f}M; free disk {free:.0f} GB")
     if a.plan_only:
         for j in J:
@@ -167,10 +186,12 @@ def main():
     if mk > a.hours:
         log(f"WARNING: the plan ({mk:.1f} h) is longer than the budget ({a.hours} h)")
     if free < 20 and not a.smoke:
-        log(f"WARNING: {free:.0f} GB free, the peak is ~18-20 GB; evaluations will wait for disk if needed")
-    state.setdefault("started", time.time())
-    state.update(model_path=model, planned_hours=mk)
+        log(f"WARNING: {free:.0f} GB free, the peak is ~19-21 GB; evaluations will wait for disk if needed")
+    session = time.time()
+    state.setdefault("started", session)
+    state.update(session_started=session, model_path=model, planned_hours=mk)
     json.dump(state, open(sp, "w"), indent=1)
+    shutil.rmtree(os.path.join(run, "report_job"), ignore_errors=True)      # the report covers what exists now
     runner = Runner(run, gpus, state, disk_limit_gb=1e9)
 
     def on_signal(sig, frame):
@@ -181,7 +202,7 @@ def main():
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT, on_signal)
     ok = runner.run(J, "phase1-seeds-smoke" if a.smoke else "phase1-seeds",
-                    deadline=state["started"] + a.max_hours * 3600)
+                    deadline=session + a.max_hours * 3600)
     rp = os.path.join(run, "report_seeds.md")
     log(f"finished; report: {rp}" if os.path.exists(rp) else "finished without report -- see logs/")
     if not ok:

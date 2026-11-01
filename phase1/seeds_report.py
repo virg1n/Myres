@@ -17,13 +17,28 @@ from phase1.metrics import load_eval  # noqa: E402
 from pilot.metrics import auroc, majority  # noqa: E402
 
 VARIANTS = [("wta1", "WTA, 1 эталон"), ("wtabal", "WTA, несколько эталонов + паросочетание"),
-            ("sftmulti", "SFT, равное время"), ("sftmulti_eq", "SFT, токенов столько же, сколько у wta1"),
-            ("loramcl", "LoRA-MCL: 4 отдельные LoRA, relaxed WTA"), ("modc", "ModC: префикс + стратегия эталона")]
+            ("sftmulti", "SFT-multi, равное время"),
+            ("sft1_eq", "SFT на эталонах wta1, токены wta1 того же seed, своё расписание LR"),
+            ("sftmulti_eq", "SFT-multi с ограничением по токенам, снимок без затухания LR"),
+            ("loramcl", "LoRA-MCL: 4 отдельные LoRA, relaxed WTA"),
+            ("modc", "ModC с метками промптовых стратегий"),
+            ("sftmodc", "SFT на эталонах modc, контроль для modc")]
 OLD = ("wta1", "wtabal", "sftmulti")
-REFS = ["sftmulti", "sftmulti_eq", "p0_strategies"]
+CONTROLS = ("sftmulti", "sft1_eq", "sftmulti_eq", "sftmodc")
 METRICS = [("pass1", "pass@1"), ("maj4", "maj@4"), ("pass4", "pass@4"), ("phi", "φ ошибок"),
            ("same_wrong", "одинаковый неверный")]
 P0 = "p0_strategies"
+OURS = ("wta1", "wtabal")
+# reference method -> who is compared with it (None = every variant)
+REFS = [("sft1_eq", None), ("sftmulti", None), ("sftmulti_eq", None), (P0, None), ("loramcl", OURS), ("modc", OURS),
+        ("sftmodc", ("modc",))]
+
+
+def compared(X, R, who):
+    if X == R or (who is not None and X not in who):
+        return False
+    # controls among themselves: only the question of the extra passes
+    return not (X in CONTROLS and R in CONTROLS) or (X, R) == ("sftmulti", "sftmulti_eq")
 
 
 def eval_dir(run, phase1, v, s):
@@ -58,14 +73,21 @@ def load_all(run, phase1, phase0, test):
     """methods[name][seed] = A; a phase-0 method has the single seed None."""
     methods, missing = {}, []
     if phase0 and os.path.isdir(phase0):
-        tests, m0 = load_methods(phase0)
-        if "strategies" in m0 and len(tests) == len(test) and [t["id"] for t in tests] == [t["id"] for t in test]:
-            methods[P0] = {None: m0["strategies"][0]}
-        else:
-            missing.append("стратегии фазы 0")
+        try:
+            tests, m0 = load_methods(phase0)
+            if "strategies" in m0 and [t["id"] for t in tests] == [t["id"] for t in test]:
+                methods[P0] = {None: m0["strategies"][0]}
+            else:
+                missing.append("стратегии фазы 0")
+        except ValueError as e:
+            missing.append(f"стратегии фазы 0 (отклонены: {e})")
     for v, _ in VARIANTS:
         for s in (0, 1, 2):
-            r = load_eval(eval_dir(run, phase1, v, s), test, "test")
+            try:
+                r = load_eval(eval_dir(run, phase1, v, s), test, "test")
+            except ValueError as e:
+                missing.append(f"{v} seed {s} (отклонён: {e})")
+                continue
             if r is None:
                 missing.append(f"{v} seed {s}")
             else:
@@ -172,14 +194,14 @@ def build(run, data, phase1, phase0, boot=1000):
              "разности совпал со средним. Для pass@1, maj@4, pass@4 лучше больше, для φ и одинакового неверного "
              "ответа — меньше.\n")
     comps = {}
-    for R in REFS:
+    for R, who in REFS:
         if R not in methods:
             continue
         L.append(f"\n### Против {R}\n")
         L.append("| X | " + " | ".join(n for _, n in METRICS) + " |")
         L.append("|---|" + "---|" * len(METRICS))
         for X, _ in VARIANTS:
-            if X == R or X not in methods or (R == "sftmulti" and X == "sftmulti_eq"):
+            if X not in methods or not compared(X, R, who):
                 continue
             pairs = seed_pairs(methods, X, R)
             if not pairs:
@@ -203,19 +225,28 @@ def build(run, data, phase1, phase0, boot=1000):
                  f"{[round(x, 2) for x in share] if share else '—'} | "
                  f"{'×' + format(r['lr_mult'], '.2f') if 'lr_mult' in r else '—'} |")
     ref = {s: r["tokens"] for v, s, r in tr if v == "wta1"}
-    eq = {s: r["tokens"] for v, s, r in tr if v == "sftmulti_eq"}
-    off = {s: round(eq[s] / ref[s], 2) for s in eq if s in ref and abs(eq[s] / ref[s] - 1) > 0.1}
-    if off:
-        L.append(f"\n**Токены sftmulti_eq расходятся с wta1 больше чем на 10%** (отношение по seed): {off}.")
+    for name in ("sft1_eq", "sftmulti_eq"):
+        eq = {s: r["tokens"] for v, s, r in tr if v == name}
+        off = {s: round(eq[s] / ref[s], 2) for s in eq if s in ref and abs(eq[s] / ref[s] - 1) > 0.1}
+        if off:
+            L.append(f"\n**Токены {name} расходятся с wta1 больше чем на 10%** (отношение по seed): {off}.")
+    f = os.path.join(run, "modc", "stats.json")
+    if os.path.exists(f):
+        L.append(f"\nДанные modc и sftmodc: {json.load(open(f))}.")
     L.append("\n## Как читать\n")
-    L.append("- Устойчивость: смотрите SD и число совпавших знаков в разделе 2.\n"
-             "- Переобучение SFT: сравните столбцы «против sftmulti» и «против sftmulti_eq». Если выигрыш wta1 и wtabal "
-             "держится против sftmulti_eq, он не объясняется лишними проходами SFT по данным.\n"
-             "- sftmulti_eq — снимок посреди косинусного расписания 2-часового запуска (LR снимка в разделе 3), "
-             "а wta1 доходит до конца расписания; это не полностью равные условия.\n"
+    L.append("- Устойчивость: смотрите SD и число совпавших знаков в разделе 2. Бутстрап оценивает неопределённость "
+             "по задачам при данных запусках; разброс seed показан отдельно, и при 3 seed он оценён грубо.\n"
+             "- Лишние проходы SFT: главный контроль — sft1_eq: те же эталоны и токены, что у wta1, и полное расписание "
+             "LR. Если выигрыш wta1 держится против него, объяснение лишними проходами становится менее вероятным, но "
+             "не исключается: кривых обучения на валидации в этом запуске нет.\n"
+             "- sftmulti_eq — дополнительный контроль. Примеры у него другие (несколько эталонов на задачу), порог токенов "
+             "один на все seed (wta1, seed 0), а снимок взят посреди косинусного расписания (LR снимка в разделе 3), "
+             "так что по нему одному выводов о равных данных делать нельзя.\n"
              "- LoRA-MCL: 4 адаптера r = 32, то есть в 4 раза больше параметров, и каждый пример проходит через все 4, "
              "поэтому за 2 часа шагов меньше (раздел 3).\n"
-             "- ModC: префикс в начале входа, разбиение по стратегии промпта, которым получен эталон.\n"
+             "- ModC с метками промптовых стратегий: префикс в начале входа, стратегия заменяет учителя из статьи. Это "
+             "наша адаптация, не исчерпывающая проверка ModC: кластеризации градиентов здесь нет. Эталоны у него "
+             "свои, поэтому эффект режимов смотрите против sftmodc, а против wta1 и wtabal разность включает и данные.\n"
              "- Если в «доле решений по режимам» один режим близок к 1, режимы схлопнулись.")
     out = os.path.join(run, "report_seeds.md")
     with open(out, "w", encoding="utf-8") as f:
