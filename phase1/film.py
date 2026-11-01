@@ -31,8 +31,25 @@ class LoRALinear(nn.Module):
         return (self.base.weight.float() + self.scale * (self.B.float() @ self.A.float())).to(self.base.weight.dtype)
 
 
+class MultiLoRALinear(nn.Module):
+    """K independent adapters (LoRA-MCL); ctx.modes [B] picks the adapter of every batch row."""
+
+    def __init__(self, base, r, alpha, K, ctx):
+        super().__init__()
+        self.base, self.ctx = base, ctx
+        self.A = nn.Parameter(torch.randn(K, r, base.in_features) / math.sqrt(base.in_features))
+        self.B = nn.Parameter(torch.zeros(K, base.out_features, r))
+        self.scale = alpha / r
+
+    def forward(self, x):
+        m = self.ctx.modes
+        A, B = self.A[m].to(x.dtype), self.B[m].to(x.dtype)
+        return self.base(x) + (x @ A.transpose(1, 2)) @ B.transpose(1, 2) * self.scale
+
+
 class Ctx:
     gamma = None          # [B, n_norms, d] or None
+    modes = None          # [B] adapter index per row (MultiLoRALinear)
 
 
 class FiLMNorm(nn.Module):
@@ -71,19 +88,22 @@ def norm_modules(model):
     return out
 
 
-def build(base_path, film_modes=0, lora_r=32, lora_alpha=64, device="cuda", grad_ckpt=True):
-    """Frozen base + LoRA (+ FiLM if film_modes > 0). Returns (model, film or None, ctx)."""
+def build(base_path, film_modes=0, lora_r=32, lora_alpha=64, device="cuda", grad_ckpt=True, lora_modes=0):
+    """Frozen base + LoRA (+ FiLM if film_modes > 0; K separate adapters if lora_modes > 0).
+    Returns (model, film or None, ctx)."""
     from transformers import AutoModelForCausalLM
     dtype = torch.bfloat16 if torch.device(device).type == "cuda" else torch.float32
     model = AutoModelForCausalLM.from_pretrained(base_path, dtype=dtype)
     for p in model.parameters():
         p.requires_grad_(False)
+    ctx, film = Ctx(), None
     for layer in model.model.layers:
         for parent in (layer.self_attn, layer.mlp):
             for name in LORA_TARGETS:
                 if hasattr(parent, name):
-                    setattr(parent, name, LoRALinear(getattr(parent, name), lora_r, lora_alpha))
-    ctx, film = Ctx(), None
+                    lin = getattr(parent, name)
+                    setattr(parent, name, MultiLoRALinear(lin, lora_r, lora_alpha, lora_modes, ctx) if lora_modes
+                            else LoRALinear(lin, lora_r, lora_alpha))
     if film_modes:
         mods = norm_modules(model)
         for i, (parent, name) in enumerate(mods):
@@ -127,31 +147,41 @@ def load_adapter(model, film, st):
 def export_modes(base_path, adapter_path, out_dirs, modes, dtype=torch.bfloat16):
     """Write one plain Qwen3 checkpoint per mode (LoRA merged, FiLM folded into norm weights).
 
-    modes: list of mode indices, or [None] for a model without FiLM. Runs on CPU."""
+    modes: list of mode indices, or [None] for a model without FiLM / with a single adapter.
+    With cfg["lora_modes"] the mode index selects which adapter is merged. Runs on CPU."""
     from transformers import AutoModelForCausalLM, AutoTokenizer
     ck = torch.load(adapter_path, map_location="cpu", weights_only=False)
     st, cfg = ck["adapter"], ck["cfg"]
     model = AutoModelForCausalLM.from_pretrained(base_path, dtype=dtype)
     r, alpha = cfg["lora_r"], cfg["lora_alpha"]
+    multi = cfg.get("lora_modes", 0)
+    targets = []                       # (key, linear, original weight) of LoRA modules with one adapter per mode
     for li, layer in enumerate(model.model.layers):
         for pname, parent in (("self_attn", layer.self_attn), ("mlp", layer.mlp)):
             for name in LORA_TARGETS:
                 key = f"model.layers.{li}.{pname}.{name}"
                 if f"{key}.A" in st:
                     lin = getattr(parent, name)
+                    if multi:
+                        targets.append((key, lin, lin.weight.detach().clone()))
+                        continue
                     delta = (alpha / r) * (st[f"{key}.B"].float() @ st[f"{key}.A"].float())
                     lin.weight.copy_((lin.weight.float() + delta).to(lin.weight.dtype))
     norms = [getattr(p, n) for p, n in norm_modules(model)]
     orig = [nm.weight.detach().clone() for nm in norms]
     film = None
-    if cfg["film_modes"]:
+    if cfg.get("film_modes"):
         film = FiLM(len(norms), model.config.hidden_size, K=cfg["film_modes"])
         film.load_state_dict({k[5:]: v for k, v in st.items() if k.startswith("film.")})
     tok = AutoTokenizer.from_pretrained(base_path)
     for out, m in zip(out_dirs, modes):
         if os.path.exists(out):
             shutil.rmtree(out)
-        if m is not None:
+        if multi:
+            for key, lin, w0 in targets:
+                delta = (alpha / r) * (st[f"{key}.B"][m].float() @ st[f"{key}.A"][m].float())
+                lin.weight.copy_((w0.float() + delta).to(w0.dtype))
+        elif m is not None:
             g = film.gamma(torch.tensor([m]))[0].float()          # [n_norms, d]
             for nm, w0, gl in zip(norms, orig, g):
                 nm.weight.copy_((w0.float() * (1 + gl)).to(w0.dtype))

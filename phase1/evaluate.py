@@ -2,6 +2,7 @@
 
 Model with K modes: every mode solves val and test (2 samples, neutral prompt), then every mode
 verifies sample 0 of every mode on test (Yes/No).  Model without modes: 8 samples + one verifier.
+ModC: the same as K modes, from one checkpoint; a mode is the "[Mode k]" prefix of the prompt.
 Exported checkpoints (~3.5 GB per mode) live in a temporary directory and are deleted at the end."""
 import argparse
 import json
@@ -17,6 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from phase1 import film as FM  # noqa: E402
 
 PY = sys.executable
+CKPT_GB = 3.5
 
 
 def log(*a):
@@ -34,16 +36,33 @@ def gen(job, model, data, out, extra=(), eager=0, max_tokens=1200):
         raise SystemExit(f"phase0.gen {job} failed (exit {rc})")
 
 
+def wait_disk(path, need_gb, timeout_h=1.0):
+    """Other evaluations delete their checkpoints when they finish; wait for them rather than fill the disk."""
+    t0 = time.time()
+    while shutil.disk_usage(path).free / 1e9 < need_gb:
+        if time.time() - t0 > timeout_h * 3600:
+            raise SystemExit(f"less than {need_gb:.1f} GB free for {timeout_h} h")
+        log(f"waiting for {need_gb:.1f} GB of free disk")
+        time.sleep(60)
+
+
 def export(base, adapter, tmp, modes):
     dirs = [os.path.join(tmp, f"mode{m if m is not None else 'X'}") for m in modes]
+    wait_disk(tmp, CKPT_GB * len(dirs) + 2)
     t0 = time.time()
     FM.export_modes(base, adapter, dirs, modes)
     log(f"exported {len(dirs)} checkpoint(s) in {(time.time() - t0) / 60:.1f} min")
     return dirs
 
 
+def adapter_cfg(adapter):
+    return torch.load(adapter, map_location="cpu", weights_only=False)["cfg"]
+
+
 def n_modes(adapter):
-    return torch.load(adapter, map_location="cpu", weights_only=False)["cfg"]["film_modes"]
+    """Modes that need their own checkpoint (FiLM codes or separate adapters)."""
+    cfg = adapter_cfg(adapter)
+    return cfg.get("film_modes", 0) or cfg.get("lora_modes", 0)
 
 
 def main():
@@ -64,10 +83,28 @@ def main():
     if os.path.exists(os.path.join(a.out, "DONE")):
         return
     tmp = a.tmp or os.path.join(a.out, "tmp_export")
+    shutil.rmtree(tmp, ignore_errors=True)         # left behind if a previous attempt was killed
     os.makedirs(tmp, exist_ok=True)
-    K = n_modes(a.adapter)
+    cfg = adapter_cfg(a.adapter)
+    prefix_modes = cfg.get("prefix_modes", 0)
+    K = n_modes(a.adapter) or prefix_modes
     try:
-        if K == 0:
+        if prefix_modes:
+            M = min(K, a.modes)
+            solve_todo = [k for k in range(M) if not all(os.path.exists(os.path.join(a.out, f"solve_{k}_{s}.jsonl.gz"))
+                                                         for s in a.sets.split(","))]
+            verify_todo = [j for j in range(M) if "test" in a.sets.split(",") and
+                           not os.path.exists(os.path.join(a.out, f"verify_{j}.json"))]
+            if solve_todo or verify_todo:
+                d = export(a.base, a.adapter, tmp, [None])[0]
+                for k in solve_todo:
+                    gen("mode_solve", d, a.data, a.out, ["--tag", str(k), "--sets", a.sets, "--n", "2", "--prefix_mode", str(k),
+                                                         "--seed", str(a.seed + 1000 * (k + 1))],
+                        max_tokens=a.max_tokens)
+                for j in verify_todo:
+                    gen("mode_verify", d, a.data, a.out, ["--tag", str(j), "--members", str(M), "--solve_dir", a.out,
+                                                          "--prefix_mode", str(j)], eager=1)
+        elif K == 0:
             if not os.path.exists(os.path.join(a.out, "verify_single.json")):
                 d = export(a.base, a.adapter, tmp, [None])[0]
                 gen("single_eval", d, a.data, a.out, ["--sets", a.sets, "--seed", str(a.seed + 1000)],

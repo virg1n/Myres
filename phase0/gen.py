@@ -56,8 +56,8 @@ def grade(probs, texts_per_problem, mode):
     return rows
 
 
-def solve(be, tok, probs, mode, n, temperature=TEMP):
-    ps = [prompts.solve_prompt(tok, p["question"], mode) for p in probs]
+def solve(be, tok, probs, mode, n, temperature=TEMP, prefix=None):
+    ps = [prompts.solve_prompt(tok, p["question"], mode, prefix) for p in probs]
     t0 = time.time()
     texts = be.generate(ps, n, temperature, TOP_P, TOP_K, MAX_TOKENS)
     rows = grade(probs, texts, mode)
@@ -66,9 +66,9 @@ def solve(be, tok, probs, mode, n, temperature=TEMP):
     return rows
 
 
-def verify(be, tok, probs, sols, mode):
+def verify(be, tok, probs, sols, mode, prefix=None):
     """P(No) of verifier `mode` for every solution text in sols (list of str per problem)."""
-    ps = [prompts.verify_prompt(tok, p["question"], s, mode) for p, s in zip(probs, sols)]
+    ps = [prompts.verify_prompt(tok, p["question"], s, mode, prefix) for p, s in zip(probs, sols)]
     t0 = time.time()
     res, missing = be.p_no(ps)
     log(f"verify mode={mode}: {len(ps)} solutions, {time.time() - t0:.0f}s, yes/no missing {missing}")
@@ -95,8 +95,10 @@ def main():
     ap.add_argument("--n", type=int, default=2, help="pool / mode_solve: samples per prompt")
     ap.add_argument("--sets", default="test", help="mode_solve / single_eval: comma-separated set names")
     ap.add_argument("--solve_dir", default="", help="mode_verify: directory with solve_<i>_test.jsonl.gz")
+    ap.add_argument("--prefix_mode", type=int, default=-1, help="mode_solve / mode_verify: ModC prefix index")
     a = ap.parse_args()
     MAX_TOKENS = a.max_tokens
+    prefix = a.prefix_mode if a.prefix_mode >= 0 else None
     os.makedirs(a.out, exist_ok=True)
     be = load_backend(a.backend, a.model, seed=a.seed, eager=bool(a.eager))
     tok = be.tok
@@ -161,13 +163,13 @@ def main():
         for s in a.sets.split(","):
             f = os.path.join(a.out, f"solve_{a.tag}_{s}.jsonl.gz")
             if not os.path.exists(f):
-                write_gz(f, solve(be, tok, load_jsonl(os.path.join(a.data, f"{s}.jsonl")), "neutral", a.n))
+                write_gz(f, solve(be, tok, load_jsonl(os.path.join(a.data, f"{s}.jsonl")), "neutral", a.n, prefix=prefix))
 
     elif a.job == "mode_verify":                    # mode `tag` verifies sample 0 of every mode i on test
         res, miss = [], 0
         for i in range(a.members):
             sols = [x["texts"][0] for x in read_gz(os.path.join(a.solve_dir, f"solve_{i}_test.jsonl.gz"))]
-            r, m = verify(be, tok, test, sols, "neutral")
+            r, m = verify(be, tok, test, sols, "neutral", prefix)
             res.append(r)
             miss += m
         write_json(os.path.join(a.out, f"verify_{a.tag}.json"), {"p_no": res, "missing": miss})   # [i][n]

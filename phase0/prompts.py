@@ -42,14 +42,19 @@ def chat(tok, system, user):
         return tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
 
 
-def solve_prompt(tok, question, mode):
+def mode_tag(prefix):
+    """ModC condition token at the start of the input; prefix = mode index or None."""
+    return "" if prefix is None else f"[Mode {prefix + 1}]\n"
+
+
+def solve_prompt(tok, question, mode, prefix=None):
     """mode: 'neutral' or index into STRATEGIES."""
     system = NEUTRAL_SOLVE if mode == "neutral" else STRATEGIES[mode][1]
-    return chat(tok, system, f"{question}\n\n{FORMAT}")
+    return chat(tok, system, f"{mode_tag(prefix)}{question}\n\n{FORMAT}")
 
 
-def verify_prompt(tok, question, solution, mode):
+def verify_prompt(tok, question, solution, mode, prefix=None):
     """mode: 'neutral' or index into VERIFY_STRATEGIES."""
     system = NEUTRAL_VERIFY if mode == "neutral" else VERIFY_STRATEGIES[mode]
     s = solution[-MAX_SOLUTION_CHARS:]
-    return chat(tok, system, VERIFY_USER.format(q=question, s=s))
+    return chat(tok, system, mode_tag(prefix) + VERIFY_USER.format(q=question, s=s))

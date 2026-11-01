@@ -9,9 +9,14 @@ variants (--variant):
   wtabal     K modes, multi-ref, references of one problem matched to distinct modes by
              relative loss (optimal assignment; never forces more splits than distinct refs)
   fixed      examples carry their mode and weight (stage-2 rounds)
-Verification examples (Yes/No) are mixed in for every variant; with modes they use batch WTA.
+  loramcl    LoRA-MCL: K separate adapters, no FiLM, one reference, relaxed WTA (Eq. 5 of the paper):
+             every example goes through all K adapters with weight 1-eps for the winner, eps/(K-1) else
+  modc       ModC with prefixes: one adapter, "[Mode k]" in the input, reference of strategy k trains mode k
+Verification examples (Yes/No) are mixed in for every variant; with modes they use batch WTA
+(loramcl: relaxed WTA as for solutions; modc: a random prefix).
 Training stops at the end of one pass or at --max_hours, the LR schedule follows whichever comes
-first, and a checkpoint is written every --ckpt_minutes (re-running resumes)."""
+first, and a checkpoint is written every --ckpt_minutes (re-running resumes).
+--snap_tokens T saves the adapter once T training tokens are reached (optionally stopping there)."""
 import argparse
 import itertools
 import json
@@ -42,19 +47,19 @@ def load_jsonl(path):
 
 
 # ----------------------------------------------------------------------------- examples
-def encode_solve(tok, q, sol):
-    p = tok.encode(prompts.solve_prompt(tok, q, "neutral"), add_special_tokens=False)
+def encode_solve(tok, q, sol, prefix=None):
+    p = tok.encode(prompts.solve_prompt(tok, q, "neutral", prefix), add_special_tokens=False)
     t = tok.encode(sol, add_special_tokens=False)[:MAX_TARGET] + tok.encode("<|im_end|>", add_special_tokens=False)
     return p, t
 
 
-def encode_verify(tok, q, sol, label):
-    p = tok.encode(prompts.verify_prompt(tok, q, sol, "neutral"), add_special_tokens=False)[-2400:]
+def encode_verify(tok, q, sol, label, prefix=None):
+    p = tok.encode(prompts.verify_prompt(tok, q, sol, "neutral", prefix), add_special_tokens=False)[-2400:]
     t = tok.encode(label + "<|im_end|>", add_special_tokens=False)
     return p, t
 
 
-def make_steps(variant, train, verify, tok, P, ver_ratio, seed):
+def make_steps(variant, train, verify, tok, P, ver_ratio, seed, K=4):
     """List of steps; each step = list of examples dict(p, t, group, kind, mode, w)."""
     rng = random.Random(seed)
     order = list(range(len(train)))
@@ -69,7 +74,12 @@ def make_steps(variant, train, verify, tok, P, ver_ratio, seed):
                 p, t = encode_solve(tok, r["question"], r["solution"])
                 ex.append(dict(p=p, t=t, group=g, kind="solve", mode=r.get("mode"), w=r.get("w", 1.0)))
                 continue
-            refs = [r["single"]] if variant in ("sft1", "wta1") else r["refs"]
+            if variant == "modc":
+                for ref in r["refs"]:
+                    p, t = encode_solve(tok, r["question"], ref["text"], ref["mode"])
+                    ex.append(dict(p=p, t=t, group=g, kind="solve", mode=ref["mode"], w=1.0))
+                continue
+            refs = [r["single"]] if variant in ("sft1", "wta1", "loramcl") else r["refs"]
             for sol in refs:
                 p, t = encode_solve(tok, r["question"], sol)
                 ex.append(dict(p=p, t=t, group=g, kind="solve", mode=None, w=1.0))
@@ -79,7 +89,8 @@ def make_steps(variant, train, verify, tok, P, ver_ratio, seed):
                 break
             v = verify[vi % len(verify)]
             vi += 1
-            p, t = encode_verify(tok, v["question"], v["solution"], v["label"])
+            prefix = rng.randrange(K) if variant == "modc" else None
+            p, t = encode_verify(tok, v["question"], v["solution"], v["label"], prefix)
             ex.append(dict(p=p, t=t, group=-1, kind="verify", mode=None, w=1.0))
         steps.append(ex)
     return steps
@@ -116,6 +127,7 @@ def collate(ex, ids, pad, dev):
 
 def per_example_nll(model, film, ctx, x, att, lab, modes):
     ctx.gamma = film.gamma(modes) if (film is not None and modes is not None) else None
+    ctx.modes = modes
     h = model.model(input_ids=x, attention_mask=att).last_hidden_state
     tgt = lab[:, 1:]
     m = tgt != -100
@@ -123,8 +135,15 @@ def per_example_nll(model, film, ctx, x, att, lab, modes):
     ce = F.cross_entropy(model.lm_head(hs).float(), tgt[m], reduction="none")
     rows = torch.arange(x.shape[0], device=x.device).unsqueeze(1).expand_as(tgt)[m]
     tot = torch.zeros(x.shape[0], device=x.device).index_add_(0, rows, ce)
-    # ctx.gamma stays set: gradient checkpointing re-runs the FiLM norms during backward
+    # ctx stays set: gradient checkpointing re-runs the FiLM norms and adapters during backward
     return tot / m.sum(1).clamp(min=1)
+
+
+def mcl_weights(nll, eps):
+    """nll [B, K] -> q [B, K]: relaxed WTA, 1-eps for the lowest loss, eps/(K-1) for the others."""
+    K = nll.shape[1]
+    q = torch.full_like(nll, eps / (K - 1))
+    return q.scatter(1, nll.argmin(1, keepdim=True), 1 - eps)
 
 
 # ----------------------------------------------------------------------------- assignment
@@ -192,7 +211,7 @@ def assign(variant, ex, L, K, eps, rng):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--variant", required=True, choices=["sft1", "sftmulti", "filmmean", "wta1", "wtamulti",
-                                                          "wtabal", "fixed"])
+                                                          "wtabal", "fixed", "loramcl", "modc"])
     ap.add_argument("--base", required=True)
     ap.add_argument("--data", required=True, help="dir with train.jsonl / verify.jsonl (or --train_file)")
     ap.add_argument("--train_file", default="")
@@ -212,8 +231,12 @@ def main():
     ap.add_argument("--ver_coef", type=float, default=0.4, help="loss = solve loss + ver_coef * verify loss")
     ap.add_argument("--eps_start", type=float, default=0.3)
     ap.add_argument("--eps_final", type=float, default=0.05)
+    ap.add_argument("--mcl_eps", type=float, default=0.05, help="loramcl: relaxation of WTA (paper, Table 1)")
     ap.add_argument("--ckpt_minutes", type=float, default=30)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--save_opt", type=int, default=1, help="0: adapter.pt without Adam moments (3x smaller)")
+    ap.add_argument("--snap_tokens", type=int, default=0, help="save snap/adapter.pt at this many training tokens")
+    ap.add_argument("--stop_after_snap", action="store_true", help="stop at --snap_tokens, adapter.pt is the snapshot")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     if os.path.exists(os.path.join(a.out, "DONE")):
@@ -226,8 +249,9 @@ def main():
     init = torch.load(a.init, map_location="cpu", weights_only=False) if a.init else None
     film_modes = a.film_modes if a.film_modes >= 0 else (
         init["cfg"]["film_modes"] if init else (a.K if a.variant in MODE_VARIANTS else 0))
-    K = film_modes or 1
-    model, film, ctx = FM.build(a.base, film_modes, a.lora_r, 2 * a.lora_r, dev)
+    K = film_modes or (a.K if a.variant in ("loramcl", "modc") else 1)
+    mcl = a.variant == "loramcl"
+    model, film, ctx = FM.build(a.base, film_modes, a.lora_r, 2 * a.lora_r, dev, lora_modes=K if mcl else 0)
     if init:
         FM.load_adapter(model, film, init["adapter"])
     lora_ps, film_ps = FM.trainable(model, film)
@@ -247,10 +271,10 @@ def main():
         e = i // per_epoch
         if e not in epoch_cache:
             epoch_cache.clear()
-            epoch_cache[e] = make_steps(a.variant, train, verify, tok, a.P, a.ver_ratio, a.seed + 1000 * e)
+            epoch_cache[e] = make_steps(a.variant, train, verify, tok, a.P, a.ver_ratio, a.seed + 1000 * e, K)
         return epoch_cache[e][i % per_epoch]
 
-    first = make_steps(a.variant, train, verify, tok, a.P, a.ver_ratio, a.seed)
+    first = make_steps(a.variant, train, verify, tok, a.P, a.ver_ratio, a.seed, K)
     per_epoch = max(1, len(first))
     epoch_cache[0] = first
     total = per_epoch * a.epochs
@@ -264,11 +288,12 @@ def main():
         opt.load_state_dict(ck["opt"])
         st = ck["state"]
         log(f"resumed at step {st['step']}")
-    cfg = {"variant": a.variant, "film_modes": film_modes, "lora_r": a.lora_r, "lora_alpha": 2 * a.lora_r}
+    cfg = {"variant": a.variant, "film_modes": film_modes, "lora_r": a.lora_r, "lora_alpha": 2 * a.lora_r,
+           "lora_modes": K if mcl else 0, "prefix_modes": K if a.variant == "modc" else 0}
     rng = random.Random(a.seed + st["step"])
     n_tr = sum(p.numel() for p in lora_ps + film_ps)
     log(f"{a.variant}: {per_epoch} steps/epoch, {sum(len(s) for s in first)} examples/epoch, trainable {n_tr / 1e6:.1f}M, "
-        f"modes {film_modes}, limit {a.max_hours} h")
+        f"modes {K}, limit {a.max_hours} h")
     t0, t_ck = time.time() - st["elapsed"], time.time()
     share = torch.zeros(K)
     agg = {"loss_s": 0.0, "n_s": 0, "loss_v": 0.0, "n_v": 0}
@@ -285,7 +310,7 @@ def main():
         for g, base_lr in zip(opt.param_groups, [a.lr, a.film_lr]):
             g["lr"] = base_lr * mult
         ex = get_step(st["step"])
-        mbs = micro(ex, a.mb_tokens)
+        mbs = micro(ex, a.mb_tokens // K if mcl else a.mb_tokens)        # loramcl: every row runs K times
         L = None
         if film is not None and a.variant in ("wta1", "wtamulti", "wtabal", "fixed"):
             # no-grad loss of every mode on every example that needs an assignment
@@ -309,9 +334,20 @@ def main():
             # weight of each example in  sum_solve(w*nll)/sum_solve(w) + ver_coef * mean_verify(nll)
             w = torch.tensor([ex[i]["w"] / max(w_solve, 1e-9) if ex[i]["kind"] == "solve" else a.ver_coef / n_ver
                               for i in ids], device=dev)
-            with torch.autocast(dev, dtype=torch.bfloat16, enabled=dev == "cuda"):
-                nll = per_example_nll(model, film, ctx, x, att, lab, md)
-            (nll * w).sum().backward()
+            if mcl:
+                n = len(ids)
+                md = torch.arange(K, device=dev).repeat(n)
+                with torch.autocast(dev, dtype=torch.bfloat16, enabled=dev == "cuda"):
+                    nll = per_example_nll(model, film, ctx, x.repeat_interleave(K, 0), att.repeat_interleave(K, 0),
+                                          lab.repeat_interleave(K, 0), md).view(n, K)
+                ((nll * mcl_weights(nll.detach(), a.mcl_eps)).sum(1) * w).sum().backward()
+                nll, win = nll.detach().min(1)
+                for i, k in zip(ids, win.tolist()):
+                    share[k] += ex[i]["kind"] == "solve"
+            else:
+                with torch.autocast(dev, dtype=torch.bfloat16, enabled=dev == "cuda"):
+                    nll = per_example_nll(model, film, ctx, x, att, lab, md)
+                (nll * w).sum().backward()
             for r, (i, v) in enumerate(zip(ids, nll.detach().float().cpu().tolist())):
                 key = "s" if ex[i]["kind"] == "solve" else "v"
                 agg["loss_" + key] += v
@@ -323,24 +359,42 @@ def main():
         if modes is not None:
             share += torch.bincount(torch.tensor([modes[i] for i, e in enumerate(ex) if e["kind"] == "solve"]),
                                     minlength=K).float()
+        elif a.variant == "modc":
+            for e in ex:
+                if e["kind"] == "solve":
+                    share[e["mode"]] += 1
         st["step"] += 1
         st["elapsed"] = time.time() - t0
+        if a.snap_tokens and not st.get("snapped") and st["tokens"] >= a.snap_tokens:
+            snap = os.path.join(a.out, "snap")
+            os.makedirs(snap, exist_ok=True)
+            if not a.stop_after_snap:
+                torch.save({"adapter": FM.adapter_state(model, film), "cfg": cfg}, os.path.join(snap, "adapter.tmp"))
+                os.replace(os.path.join(snap, "adapter.tmp"), os.path.join(snap, "adapter.pt"))
+            json.dump({"step": st["step"], "epochs": st["step"] / per_epoch, "tokens": st["tokens"],
+                       "hours": st["elapsed"] / 3600, "prog": prog, "lr_mult": mult},
+                      open(os.path.join(snap, "snap.json"), "w"), indent=1)
+            st["snapped"] = True
+            log(f"snapshot at {st['tokens'] / 1e6:.1f}M tokens, step {st['step']}, LR x{mult:.2f}")
+            if a.stop_after_snap:
+                break
         if st["step"] % 10 == 0 or st["step"] == total:
             tps = st["tokens"] / max(st["elapsed"], 1)
             log(f"step {st['step']} (epoch {st['step'] / per_epoch:.2f}) loss solve {agg['loss_s'] / max(agg['n_s'], 1):.4f} verify "
                 f"{agg['loss_v'] / max(agg['n_v'], 1):.4f} | {tps:.0f} tok/s | {st['elapsed'] / 3600:.2f} h"
-                + (f" | modes {[round(x, 2) for x in (share / share.sum().clamp(min=1)).tolist()]}" if modes else ""))
+                + (f" | modes {[round(x, 2) for x in (share / share.sum().clamp(min=1)).tolist()]}" if share.sum() else ""))
             agg = {"loss_s": 0.0, "n_s": 0, "loss_v": 0.0, "n_v": 0}
         if time.time() - t_ck > a.ckpt_minutes * 60:
             torch.save({"adapter": FM.adapter_state(model, film), "opt": opt.state_dict(), "state": st, "cfg": cfg},
                        last + ".tmp")
             os.replace(last + ".tmp", last)
             t_ck = time.time()
-    torch.save({"adapter": FM.adapter_state(model, film), "cfg": cfg, "opt": opt.state_dict()},
-               os.path.join(a.out, "adapter.pt"))
+    torch.save({"adapter": FM.adapter_state(model, film), "cfg": cfg,
+                **({"opt": opt.state_dict()} if a.save_opt else {})}, os.path.join(a.out, "adapter.pt"))
     res = {"variant": a.variant, "steps_done": st["step"], "steps_per_epoch": per_epoch,
            "epochs_done": st["step"] / per_epoch, "time_limit_h": a.max_hours, "tokens": st["tokens"],
-           "hours": st["elapsed"] / 3600, "mode_share": (share / share.sum().clamp(min=1)).tolist() if film else None}
+           "hours": st["elapsed"] / 3600, "trainable_M": n_tr / 1e6, "seed": a.seed,
+           "mode_share": (share / share.sum().clamp(min=1)).tolist() if share.sum() else None}
     json.dump(res, open(os.path.join(a.out, "result.json"), "w"), indent=1)
     if os.path.exists(last):
         os.remove(last)

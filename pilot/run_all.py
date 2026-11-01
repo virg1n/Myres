@@ -90,7 +90,8 @@ class Runner:
         self.children = []
         os.makedirs(os.path.join(run_dir, "logs"), exist_ok=True)
 
-    def run(self, jobs, title):
+    def run(self, jobs, title, deadline=None):
+        """deadline (epoch seconds): jobs that would not finish by then are skipped; soft jobs still run."""
         rk = ranks(jobs)
         load = {g: 0 for g in self.gpus}
         by = {j.name: j for j in jobs}
@@ -111,6 +112,10 @@ class Runner:
             for j in ready:
                 if not self._disk_ok():
                     break
+                if deadline and not j.soft and time.time() + j.est * 3600 > deadline:
+                    j.status = "skipped"
+                    log(f"[{title}] {j.name}: skipped, would not finish before the deadline")
+                    continue
                 if j.weight == 0:
                     self._start(j, None)
                     continue

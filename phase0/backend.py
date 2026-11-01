@@ -82,7 +82,8 @@ class HFBackend:
         out = [None] * len(prompts)
         bs = max(1, self.bs // n)
         for idx in self._batches(prompts, bs):
-            enc = self.tok([prompts[i] for i in idx], return_tensors="pt", padding=True).to(self.dev)
+            enc = self.tok([prompts[i] for i in idx], return_tensors="pt", padding=True,
+                           return_token_type_ids=False).to(self.dev)
             kw = dict(do_sample=True, temperature=temperature, top_p=top_p, top_k=top_k) if temperature > 0 \
                 else dict(do_sample=False)
             with torch.no_grad():
@@ -98,7 +99,8 @@ class HFBackend:
         torch = self.torch
         res = [0.5] * len(prompts)
         for idx in self._batches(prompts, self.bs):
-            enc = self.tok([prompts[i] for i in idx], return_tensors="pt", padding=True).to(self.dev)
+            enc = self.tok([prompts[i] for i in idx], return_tensors="pt", padding=True,
+                           return_token_type_ids=False).to(self.dev)
             with torch.no_grad():
                 logits = self.model(**enc).logits[:, -1].float()
             p = torch.softmax(logits, -1)
