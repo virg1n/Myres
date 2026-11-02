@@ -220,6 +220,13 @@ def test_report(d):
     for pair in ("wta1-loramcl", "wta1-modc", "wtabal-loramcl", "wtabal-modc", "modc-sftmodc", "wta1-sft1_eq"):
         assert f"{pair}:pass4" in c, pair
     assert c["wta1-loramcl:pass1"]["n"] == 1, "wta1 seed 2 was rejected, seed 0 of loramcl does not exist"
+    # a later seed is found in the run directory without configuration
+    write_modes(os.path.join(run, "eval", "wta1_s3"), test, data[1], np.full((K, 2, N_TEST), 100))
+    write_modes(os.path.join(run, "eval", "loramcl_s3"), test, data[0], np.full((K, 2, N_TEST), 100))
+    assert seeds_report.seeds_of(run) == [0, 1, 2, 3]
+    seeds_report.build(run, os.path.join(p1, "data"), p1, p0, boot=10)
+    c = json.load(open(os.path.join(run, "summary_seeds.json")))["comparisons"]
+    assert c["wta1-loramcl:pass1"]["n"] == 2 and "3" in c["wta1-loramcl:pass1"]["per_seed"]
     for pair in ("loramcl-modc", "sftmodc-modc", "wta1-sftmodc", "sft1_eq-sftmulti", "loramcl-wta1"):
         assert f"{pair}:pass4" not in c, pair
     print("report on fabricated data: ok")
@@ -278,6 +285,15 @@ def test_plan(d, p0, p1, base):
     assert "train_sft1_eq_s0: est 0.90 h, deps []" in out, "wta1 of seed 0 comes from phase 1"
     hours = float(out.split("simulated ")[1].split(" h")[0])
     assert hours <= 14, hours
+    # one more seed: every variant, seed 0 as before
+    out = subprocess.run(seeds_cmd(os.path.join(d, "plan"), p0, p1, base, "--plan_only", "--gpus", "0,1,2,3",
+                                   "--seeds", "0,1,2,3"), env=ENV, capture_output=True, text=True, check=True).stdout
+    print(out.splitlines()[0])
+    assert "57 jobs" in out, out
+    for v in ("wta1", "wtabal", "sftmulti", "loramcl", "modc", "sftmodc", "sft1_eq"):
+        assert f"train_{v}_s3:" in out and f"eval_{v}_s3:" in out, v
+    assert "eval_sftmulti_eq_s3:" in out and "train_sft1_eq_s3: est 0.90 h, deps ['train_wta1_s3']" in out
+    assert "--seed" not in out.splitlines()[0] and "train_wta1_s0:" not in out
     print("plan of the full run: ok")
 
 

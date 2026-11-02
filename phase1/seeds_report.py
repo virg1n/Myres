@@ -6,6 +6,7 @@ the variation of problems, the SD column covers the variation of seeds."""
 import argparse
 import json
 import os
+import re
 import sys
 import warnings
 
@@ -69,6 +70,13 @@ def verifier_auroc(A):
         return float(np.nanmean(np.diag(cell))), float(np.nanmean(cell[~np.eye(M, dtype=bool)]))
 
 
+def seeds_of(run):
+    """Planned seeds 0, 1, 2 and every other seed that has an evaluation in the run directory."""
+    d = os.path.join(run, "eval")
+    found = [re.fullmatch(r".+_s(\d+)", x) for x in (os.listdir(d) if os.path.isdir(d) else [])]
+    return sorted({0, 1, 2} | {int(m.group(1)) for m in found if m})
+
+
 def load_all(run, phase1, phase0, test):
     """methods[name][seed] = A; a phase-0 method has the single seed None."""
     methods, missing = {}, []
@@ -82,7 +90,7 @@ def load_all(run, phase1, phase0, test):
         except ValueError as e:
             missing.append(f"стратегии фазы 0 (отклонены: {e})")
     for v, _ in VARIANTS:
-        for s in (0, 1, 2):
+        for s in seeds_of(run):
             try:
                 r = load_eval(eval_dir(run, phase1, v, s), test, "test")
             except ValueError as e:
@@ -126,7 +134,7 @@ def cell(d):
 def train_rows(run, phase1):
     rows = []
     for v, _ in VARIANTS:
-        for s in (0, 1, 2):
+        for s in seeds_of(run):
             if v == "sftmulti_eq":
                 f = os.path.join(run, "train", "sftmulti_eq_s0" if s == 0 else f"sftmulti_s{s}", "snap", "snap.json")
             elif phase1 and s == 0 and v in OLD:

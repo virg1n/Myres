@@ -7,6 +7,7 @@
             of seed 0 (other examples and an unfinished LR schedule, an additional control only)
   seeds     0, 1, 2; seed 0 of wta1, wtabal, sftmulti is taken from phase 1 as it is; there sftmulti_eq
             stops at the snapshot
+            --seeds 0,1,2,3 adds seed 3 with all variants to the same run directory
   flow      modc_data -> train x19 -> eval on test x21 -> report (phase1/seeds_report.py)
 
 --max_hours counts from the start of this invocation, so a resumed run gets a new deadline; the report
@@ -45,10 +46,10 @@ def eval_seed(s):
     return 17 + 10000 * s
 
 
-def train_plan(smoke):
+def train_plan(smoke, seeds=(0, 1, 2)):
     if smoke:
         return {0: ["sftmulti_eq"], 1: OLD + NEW}
-    return {0: NEW + ["sftmulti_eq"], 1: OLD + NEW, 2: OLD + NEW}      # OLD first: sft1_eq needs wta1 of its seed
+    return {s: NEW + ["sftmulti_eq"] if s == 0 else OLD + NEW for s in seeds}      # OLD first: sft1_eq needs wta1 of its seed
 
 
 def eq_adapter(run, s):
@@ -63,7 +64,7 @@ def jobs(a, run, data, model, tokens):
     J = [Job("modc_data", [PY, "-m", "phase1.modc_data", "--data", data, "--pools", f"{a.phase0}/pool",
                            f"{a.phase1}/hard/out", "--out", f"{run}/modc"], f"{run}/modc", weight=0, est=0.05)]
     extra = ["--max_steps", "2", "--P", "4"] if sm else []
-    plan = train_plan(sm)
+    plan = train_plan(sm, a.seeds)
     for s, variants in plan.items():
         for v in variants:
             variant = {"sftmulti_eq": "sftmulti", "sft1_eq": "sft1"}.get(v, v)
@@ -143,7 +144,9 @@ def main():
     ap.add_argument("--max_tokens", type=int, default=1200)
     ap.add_argument("--smoke", action="store_true")
     ap.add_argument("--plan_only", action="store_true", help="print the jobs and the simulated time, run nothing")
+    ap.add_argument("--seeds", default="0,1,2", help="finished seeds are skipped: 0,1,2,3 adds seed 3 to a finished run")
     a = ap.parse_args()
+    a.seeds = sorted({int(s) for s in a.seeds.split(",")})
     a.phase0, a.phase1 = os.path.abspath(a.phase0), os.path.abspath(a.phase1)
     if a.smoke:
         a.max_tokens = min(a.max_tokens, 384)

@@ -76,7 +76,8 @@ def main():
     ap.add_argument("--sets", default="val,test")
     ap.add_argument("--seed", type=int, default=17, help="mode k samples with seed + 1000*(k+1)")
     ap.add_argument("--max_tokens", type=int, default=1200)
-    ap.add_argument("--min_free_gb_all", type=float, default=60.0,
+    # one at a time by default: on a volume with a quota the free space reported by the OS is not the real limit
+    ap.add_argument("--min_free_gb_all", type=float, default=1e12,
                     help="export all modes at once only if this much disk is free; else one at a time")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
