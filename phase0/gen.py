@@ -94,7 +94,8 @@ def main():
     ap.add_argument("--tag", default="", help="noise jobs: member / sigma tag used in file names")
     ap.add_argument("--members", type=int, default=4, help="noise_verify / mode_verify: number of members")
     ap.add_argument("--n", type=int, default=2, help="pool / mode_solve: samples per prompt")
-    ap.add_argument("--sets", default="test", help="mode_solve / single_eval: comma-separated set names")
+    ap.add_argument("--sets", default="test", help="mode_solve / single_eval: comma-separated set names "
+                                                   "(mode_solve: name:n sets the samples of that set)")
     ap.add_argument("--solve_dir", default="", help="mode_verify: directory with solve_<i>_test.jsonl.gz")
     ap.add_argument("--prefix_mode", type=int, default=-1, help="mode_solve / mode_verify: ModC prefix index")
     ap.add_argument("--greedy", type=int, default=0, help="k_solve: also one greedy (T = 0) solution per problem")
@@ -162,10 +163,12 @@ def main():
         write_gz(os.path.join(a.out, f"pool_{a.shard}.jsonl.gz"), rows)
 
     elif a.job == "mode_solve":                     # one mode of a phase-1 model, neutral prompt
-        for s in a.sets.split(","):
+        for item in a.sets.split(","):
+            s, _, n = item.partition(":")           # "pool:1,hv:4": samples per set, else --n
             f = os.path.join(a.out, f"solve_{a.tag}_{s}.jsonl.gz")
             if not os.path.exists(f):
-                write_gz(f, solve(be, tok, load_jsonl(os.path.join(a.data, f"{s}.jsonl")), "neutral", a.n, prefix=prefix))
+                write_gz(f, solve(be, tok, load_jsonl(os.path.join(a.data, f"{s}.jsonl")), "neutral",
+                                  int(n) if n else a.n, prefix=prefix))
 
     elif a.job == "mode_verify":                    # mode `tag` verifies sample 0 of every mode i on test
         res, miss = [], 0

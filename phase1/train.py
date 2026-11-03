@@ -11,7 +11,8 @@ variants (--variant):
   wtamulti   K modes, multi-ref, each reference goes to the mode with the lowest loss on it
   wtabal     K modes, multi-ref, references of one problem matched to distinct modes by
              relative loss (optimal assignment; never forces more splits than distinct refs)
-  fixed      examples carry their mode and weight (stage-2 rounds)
+  fixed      examples carry their mode and weight (stage-2 rounds, self-training): a row is one solution, or one
+             problem with "sols" (all its solutions in one step); from FiLM codes or separate adapters (--init)
   loramcl    LoRA-MCL: K separate adapters, no FiLM, one reference, relaxed WTA (Eq. 5 of the paper):
              every example goes through all K adapters with weight 1-eps for the winner, eps/(K-1) else
   modc       ModC with prefixes: one adapter, "[Mode k]" in the input, reference of strategy k trains mode k
@@ -76,8 +77,9 @@ def make_steps(variant, train, verify, tok, P, ver_ratio, seed, K=4):
         for g in order[s:s + P]:
             r = train[g]
             if variant == "fixed":
-                p, t = encode_solve(tok, r["question"], r["solution"])
-                ex.append(dict(p=p, t=t, group=g, kind="solve", mode=r.get("mode"), w=r.get("w", 1.0)))
+                for sol in r.get("sols") or [r]:         # a bank row: one problem with all its solutions
+                    p, t = encode_solve(tok, r["question"], sol["solution"])
+                    ex.append(dict(p=p, t=t, group=g, kind="solve", mode=sol.get("mode"), w=sol.get("w", 1.0)))
                 continue
             if variant in ("modc", "sftmodc"):
                 for ref in r["refs"]:
@@ -226,6 +228,7 @@ def main():
     ap.add_argument("--train_file", default="")
     ap.add_argument("--out", required=True)
     ap.add_argument("--init", default="", help="adapter.pt to continue from (stage 2)")
+    ap.add_argument("--init_opt", type=int, default=1, help="0: start with fresh Adam moments, not those of --init")
     ap.add_argument("--film_modes", type=int, default=-1, help="-1: from variant (K for mode variants)")
     ap.add_argument("--K", type=int, default=4, help="modes; wtaz: candidate z per example")
     ap.add_argument("--zdim", type=int, default=16, help="wtaz: dimension of z")
@@ -264,7 +267,11 @@ def main():
         raise SystemExit("wtaz trains from scratch, without --init or --film_modes")
     film_modes = a.film_modes if a.film_modes >= 0 else (
         init["cfg"]["film_modes"] if init else (a.K if a.variant in MODE_VARIANTS else 0))
-    K = film_modes or (a.K if a.variant in ("loramcl", "modc", "wtaz") else 1)
+    # fixed modes of separate adapters (LoRA-MCL): every row goes through the adapter of its mode only
+    lora_modes = init["cfg"].get("lora_modes", 0) if init and a.variant == "fixed" else 0
+    if lora_modes and film_modes:
+        raise SystemExit("--init has separate adapters per mode: no FiLM modes (--film_modes 0)")
+    K = film_modes or lora_modes or (a.K if a.variant in ("loramcl", "modc", "wtaz") else 1)
     mcl = a.variant == "loramcl"
     alpha = a.lora_alpha or 2 * a.lora_r
     if init:                  # continue with the scale of the adapter: alpha from its cfg unless given explicitly
@@ -272,14 +279,14 @@ def main():
         alpha = a.lora_alpha or c.get("lora_alpha", alpha)
         if (c.get("lora_r", a.lora_r), c.get("lora_alpha", alpha)) != (a.lora_r, alpha):
             raise SystemExit(f"--init has LoRA r {c.get('lora_r')} alpha {c.get('lora_alpha')}, asked r {a.lora_r} alpha {alpha}")
-    model, film, ctx = FM.build(a.base, film_modes, a.lora_r, alpha, dev, lora_modes=K if mcl else 0,
+    model, film, ctx = FM.build(a.base, film_modes, a.lora_r, alpha, dev, lora_modes=K if mcl else lora_modes,
                                 film_z=a.zdim if zc else 0)
     if init:
         FM.load_adapter(model, film, init["adapter"])
     lora_ps, film_ps = FM.trainable(model, film)
     groups = [{"params": lora_ps, "lr": a.lr}] + ([{"params": film_ps, "lr": a.film_lr}] if film_ps else [])
     opt = torch.optim.AdamW(groups, weight_decay=0.0, betas=(0.9, 0.99))
-    if init and init.get("opt"):
+    if init and init.get("opt") and a.init_opt:
         try:                       # keep Adam moments from the previous stage instead of a cold restart
             opt.load_state_dict(init["opt"])
         except Exception as e:
@@ -317,7 +324,7 @@ def main():
         st = ck["state"]
         log(f"resumed at step {st['step']}")
     cfg = {"variant": a.variant, "film_modes": film_modes, "lora_r": a.lora_r, "lora_alpha": alpha,
-           "lora_modes": K if mcl else 0, "prefix_modes": K if a.variant == "modc" else 0,
+           "lora_modes": K if mcl else lora_modes, "prefix_modes": K if a.variant == "modc" else 0,
            "film_z": a.zdim if zc else 0}
     rng = random.Random(a.seed + st["step"])
     n_tr = sum(p.numel() for p in lora_ps + film_ps)
@@ -350,7 +357,7 @@ def main():
         if zc:          # K fresh candidates per example; seeded by the step, so a resumed run draws the same z
             Z = film.sample_z(len(ex) * K, torch.Generator().manual_seed(a.seed * 1_000_003 + st["step"]))
             Z = Z.view(len(ex), K, -1).to(dev)
-        if film is not None and a.variant in ("wta1", "wtaz", "wtamulti", "wtabal", "fixed"):
+        if (film is not None or lora_modes) and a.variant in ("wta1", "wtaz", "wtamulti", "wtabal", "fixed"):
             # no-grad loss of every mode (candidate z) on every example that needs an assignment
             need = [i for i, e in enumerate(ex) if a.variant != "fixed" or e["kind"] == "verify"]
             sub = [ex[i] for i in need]
@@ -372,7 +379,7 @@ def main():
             agg["zgain"] = agg.get("zgain", 0.0) + gain
             agg["zgain_n"] = agg.get("zgain_n", 0) + len(sv)
         eps = a.eps_start + (a.eps_final - a.eps_start) * min(1.0, prog / 0.2)
-        modes = assign(a.variant, ex, L, K, eps, rng) if film is not None else None
+        modes = assign(a.variant, ex, L, K, eps, rng) if film is not None or lora_modes else None
         w_solve = sum(e["w"] for e in ex if e["kind"] == "solve")
         n_ver = sum(e["kind"] == "verify" for e in ex)
         for ids in mbs:

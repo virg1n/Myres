@@ -15,7 +15,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from phase1.evaluate import export, gen, n_modes  # noqa: E402
+from phase1.evaluate import adapter_cfg, export, gen, n_modes  # noqa: E402
 
 PY = sys.executable
 
@@ -89,7 +89,7 @@ def main():
             cmd = [PY, "-m", "phase1.train", "--variant", "fixed", "--base", a.base, "--data", a.data,
                    "--train_file", os.path.join(rdir, "winners.jsonl"), "--init", adapter,
                    "--out", os.path.join(rdir, "train"), "--lr", str(a.lr), "--max_hours", str(a.round_hours),
-                   "--film_modes", str(K), "--seed", str(rd + 1)] + (["--max_steps", str(a.max_steps)] if a.max_steps else [])
+                   "--film_modes", str(adapter_cfg(adapter).get("film_modes", 0)), "--seed", str(rd + 1)] + (["--max_steps", str(a.max_steps)] if a.max_steps else [])
             if subprocess.call(cmd) != 0:
                 raise SystemExit("stage-2 training failed")
         stats.append(json.load(open(os.path.join(rdir, "stats.json"))))

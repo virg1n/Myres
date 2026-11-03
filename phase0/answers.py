@@ -60,6 +60,8 @@ def to_number(s):
         return -v if m.group(1) else v
     m = re.fullmatch(r"(-?)\\frac(\d)(\d)", t)
     if m:
+        if int(m.group(3)) == 0:                      # \frac10: a malformed answer, not a crash of the grader
+            return None
         v = Fraction(int(m.group(2)), int(m.group(3)))
         return -v if m.group(1) else v
     t = t.replace(",", "") if re.fullmatch(r"-?\d{1,3}(,\d{3})+(\.\d+)?", t) else t

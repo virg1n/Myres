@@ -22,9 +22,9 @@ GPU_CAPACITY = 2          # a training job takes the whole GPU (weight 2), gener
 
 
 class Job:
-    def __init__(self, name, cmd, out, deps=(), weight=1, est=0.1, soft=False):
+    def __init__(self, name, cmd, out, deps=(), weight=1, est=0.1, soft=False, prio=0):
         self.name, self.cmd, self.out, self.deps = name, cmd, out, list(deps)
-        self.weight, self.est, self.soft = weight, est, soft
+        self.weight, self.est, self.soft, self.prio = weight, est, soft, prio      # higher prio starts first
         self.status, self.gpu, self.proc, self.t0, self.t1, self.logf = "pending", None, None, None, None, None
 
 
@@ -62,7 +62,7 @@ def simulate(jobs, gpus):
     load = {g: 0 for g in gpus}
     pending = list(jobs)
     while pending or running:
-        ready = sorted((j for j in pending if all(d in done for d in j.deps)), key=lambda j: -rk[j.name])
+        ready = sorted((j for j in pending if all(d in done for d in j.deps)), key=lambda j: (-j.prio, -rk[j.name]))
         for j in ready:
             if j.weight == 0:
                 running.append((t + j.est, j, None))
@@ -108,7 +108,7 @@ class Runner:
                     j.status = "skipped"
             ready = sorted((j for j in jobs if j.status == "pending" and all(
                 (by[d].status in ("done", "failed", "skipped")) if j.soft else (by[d].status == "done")
-                for d in j.deps if d in by)), key=lambda j: -rk[j.name])
+                for d in j.deps if d in by)), key=lambda j: (-j.prio, -rk[j.name]))
             for j in ready:
                 if not self._disk_ok():
                     break
