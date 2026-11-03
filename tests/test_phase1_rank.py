@@ -186,6 +186,9 @@ def test_smoke(d, p0, p1, base):
         for k in ("pass1", "pass4", "same_wrong"):
             c = summ["comparisons"][f"{X}-{R}:{k}"]
             want = summ["summary"][X][k]["per_seed"]["1"] - summ["summary"][R][k]["per_seed"]["1"]
+            if c is None:          # the 2-step smoke models may give no wrong answers at all: no same_wrong to compare
+                assert k == "same_wrong" and not np.isfinite(want), (X, R, k, want)
+                continue
             assert c["n"] == 1 and abs(c["mean"] - want) < 1e-12 and c["lo"] <= c["hi"], (X, R, k, c)
     print("smoke run end to end: ok")
 

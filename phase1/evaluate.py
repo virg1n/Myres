@@ -87,6 +87,8 @@ def main():
     shutil.rmtree(tmp, ignore_errors=True)         # left behind if a previous attempt was killed
     os.makedirs(tmp, exist_ok=True)
     cfg = adapter_cfg(a.adapter)
+    if cfg.get("film_z"):
+        raise SystemExit("continuous z has no modes: evaluate it with phase1.keval")
     prefix_modes = cfg.get("prefix_modes", 0)
     K = n_modes(a.adapter) or prefix_modes
     try:

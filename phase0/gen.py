@@ -7,6 +7,7 @@
   noise_solve  noisy model on the test set, neutral prompt, 2 samples
   noise_verify noisy model j verifies sample 0 of every noisy model i (neutral verifier)
   pool         base model on a shard of the train pool: 4 strategies x 2 samples
+  mode_solve, mode_verify, single_eval, k_solve   phase-1 evaluations (phase1/evaluate.py, phase1/keval.py)
 """
 import argparse
 import gzip
@@ -79,7 +80,7 @@ def main():
     global MAX_TOKENS
     ap = argparse.ArgumentParser()
     ap.add_argument("job", choices=["base_test", "noise_val", "noise_solve", "noise_verify", "pool",
-                                    "mode_solve", "mode_verify", "single_eval"])
+                                    "mode_solve", "mode_verify", "single_eval", "k_solve"])
     ap.add_argument("--model", required=True)
     ap.add_argument("--data", required=True)
     ap.add_argument("--out", required=True)
@@ -96,6 +97,7 @@ def main():
     ap.add_argument("--sets", default="test", help="mode_solve / single_eval: comma-separated set names")
     ap.add_argument("--solve_dir", default="", help="mode_verify: directory with solve_<i>_test.jsonl.gz")
     ap.add_argument("--prefix_mode", type=int, default=-1, help="mode_solve / mode_verify: ModC prefix index")
+    ap.add_argument("--greedy", type=int, default=0, help="k_solve: also one greedy (T = 0) solution per problem")
     a = ap.parse_args()
     MAX_TOKENS = a.max_tokens
     prefix = a.prefix_mode if a.prefix_mode >= 0 else None
@@ -173,6 +175,14 @@ def main():
             res.append(r)
             miss += m
         write_json(os.path.join(a.out, f"verify_{a.tag}.json"), {"p_no": res, "missing": miss})   # [i][n]
+
+    elif a.job == "k_solve":                        # one unit of phase1.keval: n samples on test (+ greedy)
+        f = os.path.join(a.out, f"solve_{a.tag}_test.jsonl.gz")
+        if not os.path.exists(f):
+            write_gz(f, solve(be, tok, test, "neutral", a.n))
+        f = os.path.join(a.out, f"greedy_{a.tag}_test.jsonl.gz")
+        if a.greedy and not os.path.exists(f):
+            write_gz(f, solve(be, tok, test, "neutral", 1, temperature=0.0))
 
     elif a.job == "single_eval":                    # model without modes: 8 samples, one verifier
         for s in a.sets.split(","):

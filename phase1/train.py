@@ -5,6 +5,9 @@ variants (--variant):
   sftmulti   no modes, all structurally distinct references (<= K)
   filmmean   K modes, multi-ref, random mode per example (z without WTA)
   wta1       K modes, one reference, relaxed WTA with per-batch capacity balancing
+  wtaz       wta1 with continuous z instead of K codes: every example draws K fresh z = N(0, I) / sqrt(zdim),
+             the one with the lowest loss trains (no capacity: the candidates belong to one example), with the
+             exploration eps of wta1 (a random other candidate)
   wtamulti   K modes, multi-ref, each reference goes to the mode with the lowest loss on it
   wtabal     K modes, multi-ref, references of one problem matched to distinct modes by
              relative loss (optimal assignment; never forces more splits than distinct refs)
@@ -81,7 +84,7 @@ def make_steps(variant, train, verify, tok, P, ver_ratio, seed, K=4):
                     p, t = encode_solve(tok, r["question"], ref["text"], ref["mode"] if variant == "modc" else None)
                     ex.append(dict(p=p, t=t, group=g, kind="solve", mode=ref["mode"], w=1.0))
                 continue
-            refs = [r["single"]] if variant in ("sft1", "wta1", "loramcl") else r["refs"]
+            refs = [r["single"]] if variant in ("sft1", "wta1", "wtaz", "loramcl") else r["refs"]
             for sol in refs:
                 p, t = encode_solve(tok, r["question"], sol)
                 ex.append(dict(p=p, t=t, group=g, kind="solve", mode=None, w=1.0))
@@ -127,8 +130,10 @@ def collate(ex, ids, pad, dev):
     return x.to(dev), att.to(dev), lab.to(dev)
 
 
-def per_example_nll(model, film, ctx, x, att, lab, modes):
-    ctx.gamma = film.gamma(modes) if (film is not None and modes is not None) else None
+def per_example_nll(model, film, ctx, x, att, lab, modes, z=None):
+    """modes [B] picks codes / adapters; z [B, zdim] gives continuous FiLM instead."""
+    ctx.gamma = film.gamma_z(z) if z is not None else \
+        film.gamma(modes) if (film is not None and modes is not None) else None
     ctx.modes = modes
     h = model.model(input_ids=x, attention_mask=att).last_hidden_state
     tgt = lab[:, 1:]
@@ -183,7 +188,9 @@ def assign(variant, ex, L, K, eps, rng):
     ver = [i for i, e in enumerate(ex) if e["kind"] == "verify"]
     if variant == "filmmean":
         return [rng.randrange(K) for _ in ex]
-    if variant == "fixed":
+    if variant == "wtaz":            # L [K candidates, n_ex]: the best z of every example, solutions and checks alike
+        modes = [int(L[:, i].argmin()) for i in range(len(ex))]
+    elif variant == "fixed":
         for i in solve:
             modes[i] = ex[i]["mode"]
     elif variant == "wta1":
@@ -199,7 +206,7 @@ def assign(variant, ex, L, K, eps, rng):
         for g, idx in groups.items():
             for i, k in zip(idx, match(L[:, idx])):
                 modes[i] = k
-    if ver:
+    if ver and variant != "wtaz":
         for i, k in zip(ver, balanced(L[:, ver])):
             modes[i] = k
     for i in range(len(ex)):
@@ -212,7 +219,7 @@ def assign(variant, ex, L, K, eps, rng):
 # ----------------------------------------------------------------------------- main
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--variant", required=True, choices=["sft1", "sftmulti", "filmmean", "wta1", "wtamulti",
+    ap.add_argument("--variant", required=True, choices=["sft1", "sftmulti", "filmmean", "wta1", "wtaz", "wtamulti",
                                                           "wtabal", "fixed", "loramcl", "modc", "sftmodc"])
     ap.add_argument("--base", required=True)
     ap.add_argument("--data", required=True, help="dir with train.jsonl / verify.jsonl (or --train_file)")
@@ -220,7 +227,8 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--init", default="", help="adapter.pt to continue from (stage 2)")
     ap.add_argument("--film_modes", type=int, default=-1, help="-1: from variant (K for mode variants)")
-    ap.add_argument("--K", type=int, default=4)
+    ap.add_argument("--K", type=int, default=4, help="modes; wtaz: candidate z per example")
+    ap.add_argument("--zdim", type=int, default=16, help="wtaz: dimension of z")
     ap.add_argument("--lora_r", type=int, default=32)
     ap.add_argument("--lora_alpha", type=float, default=0, help="0: 2 * lora_r (scale alpha / r = 2, as in phase 1)")
     ap.add_argument("--lr", type=float, default=2e-4)
@@ -251,9 +259,12 @@ def main():
     tok = AutoTokenizer.from_pretrained(a.base)
     pad = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
     init = torch.load(a.init, map_location="cpu", weights_only=False) if a.init else None
+    zc = a.variant == "wtaz"
+    if zc and (a.init or a.film_modes > 0):
+        raise SystemExit("wtaz trains from scratch, without --init or --film_modes")
     film_modes = a.film_modes if a.film_modes >= 0 else (
         init["cfg"]["film_modes"] if init else (a.K if a.variant in MODE_VARIANTS else 0))
-    K = film_modes or (a.K if a.variant in ("loramcl", "modc") else 1)
+    K = film_modes or (a.K if a.variant in ("loramcl", "modc", "wtaz") else 1)
     mcl = a.variant == "loramcl"
     alpha = a.lora_alpha or 2 * a.lora_r
     if init:                  # continue with the scale of the adapter: alpha from its cfg unless given explicitly
@@ -261,7 +272,8 @@ def main():
         alpha = a.lora_alpha or c.get("lora_alpha", alpha)
         if (c.get("lora_r", a.lora_r), c.get("lora_alpha", alpha)) != (a.lora_r, alpha):
             raise SystemExit(f"--init has LoRA r {c.get('lora_r')} alpha {c.get('lora_alpha')}, asked r {a.lora_r} alpha {alpha}")
-    model, film, ctx = FM.build(a.base, film_modes, a.lora_r, alpha, dev, lora_modes=K if mcl else 0)
+    model, film, ctx = FM.build(a.base, film_modes, a.lora_r, alpha, dev, lora_modes=K if mcl else 0,
+                                film_z=a.zdim if zc else 0)
     if init:
         FM.load_adapter(model, film, init["adapter"])
     lora_ps, film_ps = FM.trainable(model, film)
@@ -298,12 +310,15 @@ def main():
         if (ck["cfg"].get("lora_r"), ck["cfg"].get("lora_alpha")) != (a.lora_r, alpha):
             raise SystemExit(f"{last} has LoRA r {ck['cfg'].get('lora_r')} alpha {ck['cfg'].get('lora_alpha')}, "
                              f"asked r {a.lora_r} alpha {alpha}")
+        if ck["cfg"].get("film_z", 0) != (a.zdim if zc else 0):
+            raise SystemExit(f"{last} has zdim {ck['cfg'].get('film_z', 0)}, asked {a.zdim if zc else 0}")
         FM.load_adapter(model, film, ck["adapter"])
         opt.load_state_dict(ck["opt"])
         st = ck["state"]
         log(f"resumed at step {st['step']}")
     cfg = {"variant": a.variant, "film_modes": film_modes, "lora_r": a.lora_r, "lora_alpha": alpha,
-           "lora_modes": K if mcl else 0, "prefix_modes": K if a.variant == "modc" else 0}
+           "lora_modes": K if mcl else 0, "prefix_modes": K if a.variant == "modc" else 0,
+           "film_z": a.zdim if zc else 0}
     rng = random.Random(a.seed + st["step"])
     n_tr = sum(p.numel() for p in lora_ps + film_ps)
     target_tokens = json.load(open(a.target_tokens_from))["tokens"] if a.target_tokens_from else 0
@@ -331,9 +346,12 @@ def main():
             g["lr"] = base_lr * mult
         ex = get_step(st["step"])
         mbs = micro(ex, a.mb_tokens // K if mcl else a.mb_tokens)        # loramcl: every row runs K times
-        L = None
-        if film is not None and a.variant in ("wta1", "wtamulti", "wtabal", "fixed"):
-            # no-grad loss of every mode on every example that needs an assignment
+        L, Z = None, None
+        if zc:          # K fresh candidates per example; seeded by the step, so a resumed run draws the same z
+            Z = film.sample_z(len(ex) * K, torch.Generator().manual_seed(a.seed * 1_000_003 + st["step"]))
+            Z = Z.view(len(ex), K, -1).to(dev)
+        if film is not None and a.variant in ("wta1", "wtaz", "wtamulti", "wtabal", "fixed"):
+            # no-grad loss of every mode (candidate z) on every example that needs an assignment
             need = [i for i, e in enumerate(ex) if a.variant != "fixed" or e["kind"] == "verify"]
             sub = [ex[i] for i in need]
             L = torch.zeros(K, len(ex))
@@ -343,7 +361,16 @@ def main():
                     cols = [need[j] for j in ids]
                     for k in range(K):
                         md = torch.full((len(ids),), k, dtype=torch.long, device=dev)
-                        L[k, cols] = per_example_nll(model, film, ctx, x, att, lab, md).float().cpu()
+                        L[k, cols] = per_example_nll(model, film, ctx, x, att, lab, None if zc else md,
+                                                     Z[cols, k] if zc else None).float().cpu()
+        if zc:          # how much the best of K z beats an average z: ~0 if the model ignores z
+            sv = [i for i, e in enumerate(ex) if e["kind"] == "solve"]
+            gain = float((L[:, sv].mean(0) - L[:, sv].min(0).values).sum())
+            for key in ("zgain", "zgain_late") if prog >= 0.8 else ("zgain",):
+                st[key] = st.get(key, 0.0) + gain
+                st[key + "_n"] = st.get(key + "_n", 0) + len(sv)
+            agg["zgain"] = agg.get("zgain", 0.0) + gain
+            agg["zgain_n"] = agg.get("zgain_n", 0) + len(sv)
         eps = a.eps_start + (a.eps_final - a.eps_start) * min(1.0, prog / 0.2)
         modes = assign(a.variant, ex, L, K, eps, rng) if film is not None else None
         w_solve = sum(e["w"] for e in ex if e["kind"] == "solve")
@@ -366,7 +393,8 @@ def main():
                     share[k] += ex[i]["kind"] == "solve"
             else:
                 with torch.autocast(dev, dtype=torch.bfloat16, enabled=dev == "cuda"):
-                    nll = per_example_nll(model, film, ctx, x, att, lab, md)
+                    nll = per_example_nll(model, film, ctx, x, att, lab, None if zc else md,
+                                          Z[torch.tensor(ids, device=dev), md] if zc else None)
                 (nll * w).sum().backward()
             for r, (i, v) in enumerate(zip(ids, nll.detach().float().cpu().tolist())):
                 key = "s" if ex[i]["kind"] == "solve" else "v"
@@ -376,7 +404,7 @@ def main():
         torch.nn.utils.clip_grad_norm_(lora_ps + film_ps, 1.0)
         opt.step()
         opt.zero_grad(set_to_none=True)
-        if modes is not None:
+        if modes is not None and not zc:          # wtaz: a candidate index means nothing across examples
             share += torch.bincount(torch.tensor([modes[i] for i, e in enumerate(ex) if e["kind"] == "solve"]),
                                     minlength=K).float()
         elif a.variant == "modc":
@@ -402,7 +430,8 @@ def main():
             tps = st["tokens"] / max(st["elapsed"], 1)
             log(f"step {st['step']} (epoch {st['step'] / per_epoch:.2f}) loss solve {agg['loss_s'] / max(agg['n_s'], 1):.4f} verify "
                 f"{agg['loss_v'] / max(agg['n_v'], 1):.4f} | {tps:.0f} tok/s | {st['elapsed'] / 3600:.2f} h"
-                + (f" | modes {[round(x, 2) for x in (share / share.sum().clamp(min=1)).tolist()]}" if share.sum() else ""))
+                + (f" | modes {[round(x, 2) for x in (share / share.sum().clamp(min=1)).tolist()]}" if share.sum() else "")
+                + (f" | z gain {agg['zgain'] / max(agg['zgain_n'], 1):.4f}" if agg.get("zgain_n") else ""))
             agg = {"loss_s": 0.0, "n_s": 0, "loss_v": 0.0, "n_v": 0}
         if time.time() - t_ck > a.ckpt_minutes * 60:
             torch.save({"adapter": FM.adapter_state(model, film), "opt": opt.state_dict(), "state": st, "cfg": cfg,
@@ -417,6 +446,9 @@ def main():
            "hours": st["elapsed"] / 3600, "trainable_M": n_tr / 1e6, "seed": a.seed,
            "lora_r": a.lora_r, "lora_alpha": alpha,
            "mode_share": (share / share.sum().clamp(min=1)).tolist() if share.sum() else None}
+    if zc:
+        res.update(zdim=a.zdim, z_gain=st.get("zgain", 0.0) / max(st.get("zgain_n", 0), 1),
+                   z_gain_late=st["zgain_late"] / st["zgain_late_n"] if st.get("zgain_late_n") else None)
     json.dump(res, open(os.path.join(a.out, "result.json"), "w"), indent=1)
     if os.path.exists(last):
         os.remove(last)
