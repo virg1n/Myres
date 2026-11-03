@@ -222,6 +222,7 @@ def main():
     ap.add_argument("--film_modes", type=int, default=-1, help="-1: from variant (K for mode variants)")
     ap.add_argument("--K", type=int, default=4)
     ap.add_argument("--lora_r", type=int, default=32)
+    ap.add_argument("--lora_alpha", type=float, default=0, help="0: 2 * lora_r (scale alpha / r = 2, as in phase 1)")
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--film_lr", type=float, default=1e-3)
     ap.add_argument("--P", type=int, default=16, help="problems per optimizer step")
@@ -254,7 +255,13 @@ def main():
         init["cfg"]["film_modes"] if init else (a.K if a.variant in MODE_VARIANTS else 0))
     K = film_modes or (a.K if a.variant in ("loramcl", "modc") else 1)
     mcl = a.variant == "loramcl"
-    model, film, ctx = FM.build(a.base, film_modes, a.lora_r, 2 * a.lora_r, dev, lora_modes=K if mcl else 0)
+    alpha = a.lora_alpha or 2 * a.lora_r
+    if init:                  # continue with the scale of the adapter: alpha from its cfg unless given explicitly
+        c = init["cfg"]
+        alpha = a.lora_alpha or c.get("lora_alpha", alpha)
+        if (c.get("lora_r", a.lora_r), c.get("lora_alpha", alpha)) != (a.lora_r, alpha):
+            raise SystemExit(f"--init has LoRA r {c.get('lora_r')} alpha {c.get('lora_alpha')}, asked r {a.lora_r} alpha {alpha}")
+    model, film, ctx = FM.build(a.base, film_modes, a.lora_r, alpha, dev, lora_modes=K if mcl else 0)
     if init:
         FM.load_adapter(model, film, init["adapter"])
     lora_ps, film_ps = FM.trainable(model, film)
@@ -285,21 +292,29 @@ def main():
         total = min(total, a.max_steps)
     st = {"step": 0, "tokens": 0, "elapsed": 0.0}
     last = os.path.join(a.out, "last.pt")
+    ck = None
     if os.path.exists(last):
         ck = torch.load(last, map_location="cpu", weights_only=False)
+        if (ck["cfg"].get("lora_r"), ck["cfg"].get("lora_alpha")) != (a.lora_r, alpha):
+            raise SystemExit(f"{last} has LoRA r {ck['cfg'].get('lora_r')} alpha {ck['cfg'].get('lora_alpha')}, "
+                             f"asked r {a.lora_r} alpha {alpha}")
         FM.load_adapter(model, film, ck["adapter"])
         opt.load_state_dict(ck["opt"])
         st = ck["state"]
         log(f"resumed at step {st['step']}")
-    cfg = {"variant": a.variant, "film_modes": film_modes, "lora_r": a.lora_r, "lora_alpha": 2 * a.lora_r,
+    cfg = {"variant": a.variant, "film_modes": film_modes, "lora_r": a.lora_r, "lora_alpha": alpha,
            "lora_modes": K if mcl else 0, "prefix_modes": K if a.variant == "modc" else 0}
     rng = random.Random(a.seed + st["step"])
     n_tr = sum(p.numel() for p in lora_ps + film_ps)
     target_tokens = json.load(open(a.target_tokens_from))["tokens"] if a.target_tokens_from else 0
     log(f"{a.variant}: {per_epoch} steps/epoch, {sum(len(s) for s in first)} examples/epoch, trainable {n_tr / 1e6:.1f}M, "
-        f"modes {K}, limit {a.max_hours} h")
+        f"modes {K}, LoRA r {a.lora_r} alpha {alpha:g}, limit {a.max_hours} h")
     t0, t_ck = time.time() - st["elapsed"], time.time()
     share = torch.zeros(K)
+    if ck is not None and "rng" in ck:         # the same assignments and cumulative mode shares as without the stop
+        rng.setstate(ck["rng"])
+        share = ck["share"]
+    ck = None
     agg = {"loss_s": 0.0, "n_s": 0, "loss_v": 0.0, "n_v": 0}
     model.train()
     while st["step"] < total and first and first[0]:
@@ -390,7 +405,8 @@ def main():
                 + (f" | modes {[round(x, 2) for x in (share / share.sum().clamp(min=1)).tolist()]}" if share.sum() else ""))
             agg = {"loss_s": 0.0, "n_s": 0, "loss_v": 0.0, "n_v": 0}
         if time.time() - t_ck > a.ckpt_minutes * 60:
-            torch.save({"adapter": FM.adapter_state(model, film), "opt": opt.state_dict(), "state": st, "cfg": cfg},
+            torch.save({"adapter": FM.adapter_state(model, film), "opt": opt.state_dict(), "state": st, "cfg": cfg,
+                        "rng": rng.getstate(), "share": share},
                        last + ".tmp")
             os.replace(last + ".tmp", last)
             t_ck = time.time()
@@ -399,6 +415,7 @@ def main():
     res = {"variant": a.variant, "steps_done": st["step"], "steps_per_epoch": per_epoch,
            "epochs_done": st["step"] / per_epoch, "time_limit_h": a.max_hours, "tokens": st["tokens"],
            "hours": st["elapsed"] / 3600, "trainable_M": n_tr / 1e6, "seed": a.seed,
+           "lora_r": a.lora_r, "lora_alpha": alpha,
            "mode_share": (share / share.sum().clamp(min=1)).tolist() if share.sum() else None}
     json.dump(res, open(os.path.join(a.out, "result.json"), "w"), indent=1)
     if os.path.exists(last):
