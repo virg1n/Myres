@@ -167,15 +167,16 @@ def cmd_base(a):
         if not os.path.exists(dst):
             t0 = time.time()
             p = hf_hub_download(a.repo, sh, local_dir=tmp)
-            try:
-                sd = torch.load(p, map_location="cpu", weights_only=True, mmap=True)
-            except RuntimeError:
-                sd = torch.load(p, map_location="cpu", weights_only=True)
-            out = {k: v.to(torch.bfloat16).contiguous() for k, v in sd.items()}
+            # read the whole shard into RAM (no mmap) and delete the .bin before writing: when --out and --tmp share a
+            # file system (both in /dev/shm), the peak is the converted shards plus one .bin (~17 GB), not plus both
+            sd = torch.load(p, map_location="cpu", weights_only=True)
+            os.remove(p)
+            out = {}
+            for k in list(sd):
+                out[k] = sd.pop(k).to(torch.bfloat16).contiguous()
             del sd
             save_file(out, dst + ".tmp", metadata={"format": "pt"})
             os.replace(dst + ".tmp", dst)
-            os.remove(p)
             log(f"{sh} -> {name} ({len(out)} tensors) in {(time.time() - t0) / 60:.1f} min")
             del out
         from safetensors import safe_open
