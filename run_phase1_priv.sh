@@ -52,6 +52,7 @@ ARGS=(--bench "$BENCH" --run "$OUT" --seeds_run "$SEEDS_RUN" --self_run "$SELF_R
 if [ "$BENCH" = mt ]; then
   echo "== base model: ALMA-7B-Pretrain -> $OUT/base (bf16 safetensors, once)"
   export HF_XET_CHUNK_CACHE_SIZE_BYTES=0      # no Xet chunk cache in ~/.cache: the shards would also land under the quota
+  mkdir -p "$(readlink -m "$OUT/base")"      # $OUT/base may link to /dev/shm, which a pod restart empties
   python3 -m phase1.pmt base --out "$OUT/base" ${MT_TMP:+--tmp "$MT_TMP"}
   ARGS+=(--mt_base "$OUT/base")
 fi
