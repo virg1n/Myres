@@ -58,7 +58,7 @@ if [ "$BENCH" = mt ]; then
 fi
 python3 -m phase1.prun "${ARGS[@]}" --hours "$HOURS" --max_hours "$MAX_HOURS" --plan_only "$@"
 
-if [ ! -f "$OUT/STATUS.md" ]; then
+if [ ! -f "$OUT/STATUS.md" ] || [ "${SMOKE:-0}" != 0 ]; then     # SMOKE=1: a smoke run also for a directory in use
   echo "== smoke run: $OUT.smoke"
   rm -rf "$OUT.smoke"
   SM=("${ARGS[@]}")

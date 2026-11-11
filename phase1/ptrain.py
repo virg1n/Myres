@@ -14,12 +14,26 @@ variants (--variant):
          20% of training); then one pass with gradient through the assigned mode
   mcl    relaxed WTA of LoRA-MCL (their Eq. 5, eps = --mcl_eps): every example through all K modes with gradient,
          weight 1 - eps for the lowest loss, eps / (K - 1) for the others
+  oracle (math, --modc_file) supervised routing: the reference of strategy k always trains mode k (no eps on
+         solutions); verifier examples as in wta (by loss, with eps)
+  match  (math, --modc_file) wta inside a problem (match_assign): the references of one problem (different strategies)
+         always go to different modes, the best such assignment by loss, with the batch capacity of wta1; exploration
+         replaces a whole problem's assignment by a random one with distinct modes (probability eps), so the
+         constraint holds at every step; problems in random order, ties broken at random (the references are sorted
+         by strategy: a fixed tie order would leak the labels)
 The private share is --r_p / (--r_s + --r_p); FiLM codes with --film 1.
+
+--modc_file (math): rows {id, question, refs: [{mode: strategy, text}]} of phase1/modc_data.py (the first correct
+solution of every prompt strategy, <= 4 per problem) instead of the single reference of train.jsonl; sft and wta take
+it too (the controls with the same data: sft without modes, wta with batch assignment that may give two strategies of
+one problem the same mode). A step holds whole problems, P = round(16 / references per problem) by default, so a step
+has about as many solution examples as with one reference.
 
 Budget: --target_tokens (or --target_tokens_from a result.json: its "tokens") and/or --epochs; the run ends at
 whichever comes first and the LR schedule follows the same progress. --max_hours is a safety limit only.
 Checkpoints every --ckpt_minutes (0: never, the disk is small) with Adam moments; re-running resumes."""
 import argparse
+import itertools
 import json
 import math
 import os
@@ -31,7 +45,8 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from phase1 import priv as PV  # noqa: E402
-from phase1.train import assign, collate, load_jsonl, make_steps, mcl_weights, micro, per_example_nll  # noqa: E402
+from phase1.train import (assign, balanced, collate, load_jsonl, make_steps, mcl_weights, micro,  # noqa: E402
+                          per_example_nll)
 
 MT_PROMPT = "Translate this from English to German:\nEnglish: {src}\nGerman:"
 MT_MAX_NEW = 256
@@ -93,12 +108,54 @@ def eps_at(prog, start, final):
     return start + (final - start) * min(1.0, prog / 0.2)
 
 
+def match_assign(ex, L, K, eps, rng, cap_factor=1.25):
+    """Mode of every example for --variant match. Solutions: the references of one problem get distinct modes. The
+    problems are taken in random order; each gets, among the modes still under the capacity ceil(cap_factor * n / K)
+    of wta1 (or the least loaded ones when too few are left), the injective assignment with the lowest summed loss
+    (permutations tried in random order, so ties fall at random); with probability eps a random injective assignment
+    instead. Verifier examples: balanced by relative loss with eps, as in wta1."""
+    modes = [0] * len(ex)
+    solve = [i for i, e in enumerate(ex) if e["kind"] == "solve"]
+    ver = [i for i, e in enumerate(ex) if e["kind"] == "verify"]
+    groups = {}
+    for i in solve:
+        groups.setdefault(ex[i]["group"], []).append(i)
+    if any(len(v) > K for v in groups.values()):
+        raise ValueError(f"a problem has more references than the {K} modes")
+    cap = math.ceil(len(solve) / K * cap_factor)
+    load = [0] * K
+    order = list(groups)
+    rng.shuffle(order)
+    for g in order:
+        idx = groups[g]
+        M = len(idx)
+        if rng.random() < eps:
+            perm = rng.sample(range(K), M)
+        else:
+            free = [k for k in range(K) if load[k] < cap]
+            pool = free if len(free) >= M else sorted(range(K), key=lambda k: (load[k], k))[:M]
+            perms = list(itertools.permutations(pool, M))
+            rng.shuffle(perms)
+            perm = min(perms, key=lambda p: sum(float(L[p[m], idx[m]]) for m in range(M)))
+        for i, k in zip(idx, perm):
+            modes[i] = k
+            load[k] += 1
+    if ver:
+        for i, k in zip(ver, balanced(L[:, ver])):
+            modes[i] = k
+        for i in ver:
+            if rng.random() < eps:
+                modes[i] = (modes[i] + rng.randrange(1, K)) % K
+    return modes
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--task", required=True, choices=["math", "mt"])
-    ap.add_argument("--variant", required=True, choices=["sft", "wta", "mcl"])
+    ap.add_argument("--variant", required=True, choices=["sft", "wta", "mcl", "oracle", "match"])
     ap.add_argument("--base", required=True)
     ap.add_argument("--data", required=True, help="math: dir with train.jsonl, verify.jsonl; mt: dir with train.jsonl")
+    ap.add_argument("--modc_file", default="", help="math: strategy-labelled references (phase1/modc_data.py)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--K", type=int, default=4)
     ap.add_argument("--r_s", type=int, default=32)
@@ -127,6 +184,23 @@ def main(argv=None):
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args(argv)
     mt = a.task == "mt"
+    if a.variant in ("oracle", "match") and not a.modc_file:
+        raise SystemExit(f"--variant {a.variant} needs --modc_file (references labelled by strategy)")
+    if a.modc_file and (mt or a.variant == "mcl"):
+        raise SystemExit("--modc_file is for math with sft, wta, oracle, match")
+    modc = load_jsonl(a.modc_file) if a.modc_file else None
+    n_refs = 1.0
+    if modc is not None:
+        if not modc or any(not r.get("refs") for r in modc):
+            raise SystemExit(f"{a.modc_file}: rows without references")
+        n_refs = sum(len(r["refs"]) for r in modc) / len(modc)
+        top = max(ref["mode"] for r in modc for ref in r["refs"])
+        most = max(len(r["refs"]) for r in modc)
+        if a.variant == "oracle" and top >= a.K:
+            raise SystemExit(f"oracle: strategy {top} in {a.modc_file} needs --K > {top}")
+        if a.variant == "match" and most > a.K:
+            raise SystemExit(f"match: a problem has {most} references, more than --K {a.K} modes")
+        a.P = a.P or max(1, round(16 / n_refs))
     a.P = a.P or (256 if mt else 16)
     a.lr = a.lr or (2e-5 if mt else 2e-4)
     a.film_lr = a.film_lr or 5 * a.lr
@@ -148,8 +222,12 @@ def main(argv=None):
     # everything that changes the result: a finished or resumed run with another recipe is refused
     fp = {f: [os.path.getsize(f), int(os.path.getmtime(f))] for f in
           [os.path.join(a.data, "train.jsonl")] + ([os.path.join(a.data, "verify.jsonl")] if not mt else [])
-          if os.path.exists(f)}
-    recipe = {k: v for k, v in vars(a).items() if k not in ("max_hours", "ckpt_minutes", "out")}
+          + ([os.path.abspath(a.modc_file)] if a.modc_file else []) if os.path.exists(f)}
+    # modc_file only when given: runs made before this option keep their recipe
+    recipe = {k: v for k, v in vars(a).items() if k not in ("max_hours", "ckpt_minutes", "out")
+              and not (k == "modc_file" and not v)}
+    if a.modc_file:
+        recipe["modc_file"] = os.path.abspath(a.modc_file)
     recipe.update(base=os.path.abspath(a.base), data=os.path.abspath(a.data), inputs=fp, target=target, alpha=alpha,
                   target_tokens_from=os.path.abspath(a.target_tokens_from) if a.target_tokens_from else "")
     rf = os.path.join(a.out, "recipe.json")
@@ -169,11 +247,13 @@ def main(argv=None):
     pad = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
     cfg = {"format": "priv", "task": a.task, "variant": a.variant, "K": K, "r_s": a.r_s, "r_p": a.r_p,
            "alpha": alpha, "film": bool(a.film), "dropout": a.dropout, "seed": a.seed}
+    if a.modc_file:
+        cfg["refs"] = "modc"
     model, film, ctx = PV.build(a.base, K, a.r_s, a.r_p, alpha, bool(a.film), dev, True, a.dropout)
     lora_ps, film_ps = PV.trainable(model, film)
     groups = [{"params": lora_ps, "lr": a.lr}] + ([{"params": film_ps, "lr": a.film_lr}] if film_ps else [])
     opt = torch.optim.AdamW(groups, weight_decay=a.wd, betas=(0.9, 0.99) if not mt else (0.9, 0.999))
-    train = load_jsonl(os.path.join(a.data, "train.jsonl"))
+    train = modc if modc is not None else load_jsonl(os.path.join(a.data, "train.jsonl"))
     vf = os.path.join(a.data, "verify.jsonl")
     verify = load_jsonl(vf) if not mt and os.path.exists(vf) else []
 
@@ -183,7 +263,9 @@ def main(argv=None):
             if bad and e == 0:
                 log(f"{bad} pairs whose prompt tokens change when the target follows (split at the prompt length)")
             return st_
-        return make_steps("wta1", train, verify, tok, a.P, a.ver_ratio, a.seed + 1000 * e, max(K, 1))
+        # modc rows: every reference of a problem, its strategy in "mode", no prefix in the prompt
+        return make_steps("sftmodc" if modc is not None else "wta1", train, verify, tok, a.P, a.ver_ratio,
+                          a.seed + 1000 * e, max(K, 1))
 
     cache = {0: epoch_steps(0)}
     per_epoch = len(cache[0])
@@ -251,17 +333,26 @@ def main(argv=None):
         ex = get_step(st["step"])
         eps = eps_at(prog, a.eps_start, a.eps_final)
         modes = None
-        if a.variant == "wta":
+        if a.variant in ("wta", "oracle", "match"):
+            # the loss of every mode decides the assignment; oracle needs it for the verifier examples only
+            need = [i for i, e in enumerate(ex) if a.variant != "oracle" or e["kind"] == "verify"]
+            sub = [ex[i] for i in need]
             L = torch.zeros(K, len(ex))
-            model.eval()                   # the loss of every mode without dropout noise decides the assignment
+            model.eval()                   # without dropout noise
             with torch.no_grad(), torch.autocast(dev, dtype=torch.bfloat16, enabled=dev == "cuda"):
-                for ids in micro(ex, a.mb_tokens):
-                    x, att, lab = collate(ex, ids, pad, dev)
+                for ids in micro(sub, a.mb_tokens):
+                    x, att, lab = collate(sub, ids, pad, dev)
+                    cols = [need[j] for j in ids]
                     for k in range(K):
                         md = torch.full((len(ids),), k, dtype=torch.long, device=dev)
-                        L[k, ids] = per_example_nll(model, film, ctx, x, att, lab, md).float().cpu()
+                        L[k, cols] = per_example_nll(model, film, ctx, x, att, lab, md).float().cpu()
             model.train()
-            modes = assign("wta1", ex, L, K, eps, rng)
+            # wta: train.assign wta1 (batch-balanced by relative loss); oracle: train.assign fixed (the mode the
+            # example carries, here its strategy); match: distinct modes inside a problem; verifiers balanced in all
+            if a.variant == "match":
+                modes = match_assign(ex, L, K, eps, rng)
+            else:
+                modes = assign({"wta": "wta1", "oracle": "fixed"}[a.variant], ex, L, K, eps, rng)
             share += torch.bincount(torch.tensor([modes[i] for i, e in enumerate(ex) if e["kind"] == "solve"]),
                                     minlength=K).float()
         w_solve = sum(e["w"] for e in ex if e["kind"] == "solve")
@@ -308,7 +399,8 @@ def main(argv=None):
     res = {"task": a.task, "variant": a.variant, "K": K, "r_s": a.r_s, "r_p": a.r_p, "private_share": a.r_p / (a.r_s + a.r_p),
            "film": bool(a.film), "alpha": alpha, "steps_done": st["step"], "steps_per_epoch": per_epoch,
            "epochs_done": st["step"] / per_epoch, "tokens": st["tokens"], "target_tokens": target, "hours": st["elapsed"] / 3600,
-           "trainable_M": n_tr / 1e6, "seed": a.seed, "stop": stop,
+           "trainable_M": n_tr / 1e6, "seed": a.seed, "stop": stop, "refs": "modc" if modc is not None else "single",
+           "P": a.P, "refs_per_problem": n_refs if modc is not None else 1.0,
            "mode_share": (share / share.sum()).tolist() if share.sum() else None}
     json.dump(res, open(os.path.join(a.out, "result.json"), "w"), indent=1)
     if os.path.exists(last):

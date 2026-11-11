@@ -15,6 +15,15 @@ separate adapters as LoRA-MCL, plus FiLM). A point of --points is r_p, or a keyw
                            loramcl  LoRA-MCL of phase1_seeds (4 x r 32, no FiLM, 2 h by time: ~half the tokens),
                                  evaluated only, a reference outside the curve
                  default sft,0,2,13,32,loramcl: three new trainings per seed (6%, 41%, 100% private)
+                 strategy-labelled references (modc of phase1_seeds: the first correct solution of every prompt
+                 strategy, <= 4 per problem), FiLM codes, r_p from an optional number (oracle2: r_s 30, r_p 2):
+                           oracle  the reference of strategy k trains mode k (supervised routing)
+                           match   references of one problem always in different modes, by loss, with the
+                                   batch capacity of wta1 (no labels)
+                           wtamc   the same references, wta of wta1 over the batch (two strategies of a problem
+                                   may share a mode): the control for match
+                           sftmc   the same references without modes: the control for the data
+                 e.g. --points sftmc,wtamc,match,oracle: four new trainings per seed, the wta1 tokens each
   --bench mt     the en->de benchmark of LoRA-MCL (phase1/pmt.py): ALMA-7B-Pretrain, ~14k pairs, 2 epochs, LR 2e-5,
                  256 pairs per step, K = 3, R = 16, LoRA dropout 0.05
                  keywords: sft (LoRA-MLE r 16), mcl (LoRA-MCL as in the paper: 3 x r 16, relaxed WTA eps 0.05, no
@@ -28,6 +37,7 @@ two benchmarks one after the other, never at the same time."""
 import argparse
 import json
 import os
+import re
 import shutil
 import signal
 import sys
@@ -47,9 +57,28 @@ def wta1_dir(a, s):
     return f"{a.phase1}/train/wta1" if s == 0 else f"{a.seeds_run}/train/wta1_s{s}"
 
 
+MC_KINDS = {"oracle": "oracle", "match": "match", "wtamc": "wta_mc", "sftmc": "sft_mc"}
+MC_LABEL = {"oracle": "оракул: стратегия k → режим k", "match": "разные режимы внутри задачи",
+            "wta_mc": "wta по батчу на тех же эталонах", "sft_mc": "SFT на всех эталонах стратегий"}
+MC_NOTE = {"oracle": "эталоны всех стратегий (modc); эталон стратегии k всегда учит режим k — маршрутизация по меткам",
+           "match": "эталоны всех стратегий; эталоны одной задачи всегда в разных режимах, по лоссу, с ёмкостью "
+                    "режимов wta1 (без меток)",
+           "wta_mc": "эталоны всех стратегий; назначение как у wta1 по всему батчу — контроль для «разные режимы "
+                     "внутри задачи»",
+           "sft_mc": "эталоны всех стратегий, без режимов — контроль на сами данные"}
+
+
 def parse_points(spec, bench, R):
     pts = []
     for x in [t.strip() for t in spec.split(",") if t.strip()]:
+        mc = re.fullmatch(r"(oracle|match|wtamc|sftmc)(\d*)", x)
+        if mc and bench == "math":
+            kind, r = MC_KINDS[mc.group(1)], int(mc.group(2) or 0)
+            if kind == "sft_mc" and r or r > R:
+                raise SystemExit(f"point {x!r}: r_p 0..{R} (sftmc has no modes)")
+            pts.append({"name": x, "kind": kind, "r_p": r, "share": None if kind == "sft_mc" else r / R,
+                        "curve": False})
+            continue
         if x in ("sft",):
             pts.append({"name": "sft", "kind": "sft", "r_p": 0, "share": None, "curve": False})
         elif x == "loramcl" and bench == "math":
@@ -67,8 +96,16 @@ def parse_points(spec, bench, R):
             raise SystemExit(f"unknown point {x!r} for {bench} (r_p 0..{R}, sft, {'loramcl' if bench == 'math' else 'mcl'})")
     if len({p["name"] for p in pts}) != len(pts):
         raise SystemExit("repeated points")
+    notes = {"sft": "один эталон на задачу, без режимов", "existing_wta1": "фаза 1, LR и eps по времени (2 ч)",
+             "existing_mcl": "4 отдельные LoRA r 32 без FiLM, relaxed WTA, 2 ч по времени (~половина токенов)",
+             "mcl": "отдельные LoRA без FiLM, relaxed WTA (eps 0.05)", **MC_NOTE}
     for p in pts:
         R_, rp = R, p["r_p"]
+        p["note"] = notes.get(p["kind"], "один эталон на задачу, wta1 с балансировкой по батчу" if bench == "math"
+                              else "wta с балансировкой по батчу")
+        if p["kind"] in MC_LABEL:
+            p["label"] = MC_LABEL[p["kind"]] + (f" (r_s {R_ - rp}, r_p {rp})" if rp else "")
+            continue
         p["label"] = {"sft": "SFT (без режимов)", "existing_mcl": "LoRA-MCL (phase1_seeds, 2 ч по времени)",
                       "existing_wta1": "wta1 (фаза 1, 2 ч по времени)",
                       "mcl": "LoRA-MCL (relaxed WTA)" if bench == "mt" else "LoRA-MCL (relaxed WTA, токены wta1)",
@@ -100,13 +137,20 @@ def train_cmd(a, p, s, out, data, model):
         v = ["--variant", "mcl", "--K", str(K), "--r_s", "0", "--r_p", str(R), "--film", "0"]
     elif p["kind"] == "wta_nofilm":
         v = ["--variant", "wta", "--K", str(K), "--r_s", str(R - p["r_p"]), "--r_p", str(p["r_p"]), "--film", "0"]
+    elif p["kind"] == "sft_mc":
+        v = ["--variant", "sft", "--K", "1", "--r_s", str(R), "--r_p", "0", "--film", "0"]
+    elif p["kind"] in ("oracle", "match", "wta_mc"):
+        v = ["--variant", {"wta_mc": "wta"}.get(p["kind"], p["kind"]), "--K", str(K), "--r_s", str(R - p["r_p"]),
+             "--r_p", str(p["r_p"]), "--film", "1"]
     else:
         v = ["--variant", "wta", "--K", str(K), "--r_s", str(R - p["r_p"]), "--r_p", str(p["r_p"]), "--film", "1"]
     cmd = [PY, "-m", "phase1.ptrain", "--task", a.bench, "--base", model, "--data", data, "--out", out,
            "--seed", str(s), *v]
+    if p["kind"] in MC_LABEL:
+        cmd += ["--modc_file", modc_file(a, data)]
     if a.bench == "math":
         if a.smoke:
-            cmd += ["--max_steps", "2", "--P", "4"]
+            cmd += ["--max_steps", "2", "--P", "2" if p["kind"] in MC_LABEL else "4"]
         else:
             cmd += ["--target_tokens_from", f"{wta1_dir(a, s)}/result.json"]
     else:
@@ -114,9 +158,13 @@ def train_cmd(a, p, s, out, data, model):
     return cmd
 
 
+def modc_file(a, data):
+    return f"{data}/modc_train.jsonl" if a.smoke else f"{a.seeds_run}/modc/train.jsonl"
+
+
 def est_train(a, p):
     if a.bench == "math":
-        return {"sft": 1.1, "mcl": 3.0}.get(p["kind"], 2.2)
+        return {"sft": 1.1, "sft_mc": 1.1, "oracle": 1.5, "mcl": 3.0}.get(p["kind"], 2.2)
     return {"sft": 1.0, "mcl": 3.5}.get(p["kind"], 2.5) if not a.smoke else 0.1
 
 
@@ -141,7 +189,7 @@ def jobs(a, run, model, pts):
                                                        "--set_file", f"{run}/data/hv.jsonl", "--out", g, "--k", str(a.k),
                                                        "--seed", str(eval_seed(s)), "--max_tokens", str(a.max_tokens),
                                                        "--disk_root", a.disk_root, "--disk_gb", str(a.disk_gb)],
-                             g, deps, weight=2, est=0.2 if p["kind"] == "sft" else 0.6))
+                             g, deps, weight=2, est=0.2 if p["kind"] in ("sft", "sft_mc") else 0.6))
                 J.append(Job(f"nll_{p['name']}_s{s}", [PY, "-m", "phase1.peval", "nll", "--base", model, "--adapter", ad,
                                                        "--refs", f"{run}/refs/refs.jsonl.gz", "--out", n],
                              n, deps + ["refs"], weight=2, est=0.15))
@@ -182,6 +230,11 @@ def smoke_math_data(a, run):
     for name, n in (("train", 24), ("verify", 24)):
         with open(os.path.join(a.phase1, "data", f"{name}.jsonl")) as f, open(os.path.join(d, f"{name}.jsonl"), "w") as g:
             g.writelines(l for i, l in enumerate(f) if i < n)
+    src = f"{a.seeds_run}/modc/train.jsonl"
+    if os.path.exists(src):          # the labelled references of the same problems
+        ids = {json.loads(l)["id"] for l in open(os.path.join(d, "train.jsonl")) if l.strip()}
+        with open(src) as f, open(os.path.join(d, "modc_train.jsonl"), "w") as g:
+            g.writelines(l for l in f if l.strip() and json.loads(l)["id"] in ids)
 
 
 def parse(argv=None):
@@ -217,7 +270,10 @@ def parse(argv=None):
     if a.smoke:
         a.seeds = a.seeds[:1]
         a.max_tokens, a.k = min(a.max_tokens, 256), 4
-        a.points = "sft,2" if a.bench == "math" else "sft,mcl,1"
+        # the new code paths of the asked points: the labelled references when any is asked
+        mc = a.bench == "math" and any(re.fullmatch(r"(oracle|match|wtamc|sftmc)\d*", t.strip())
+                                       for t in a.points.split(","))
+        a.points = ("sft,sftmc,wtamc,match,oracle" if mc else "sft,2") if a.bench == "math" else "sft,mcl,1"
     a.run_abs = os.path.abspath(a.run)
     a.disk_root = os.path.abspath(a.disk_root or os.path.dirname(a.run_abs))
     return a
@@ -235,6 +291,8 @@ def check_inputs(a, pts):
                     need.append(ad)
                 elif not a.smoke:
                     need.append(f"{wta1_dir(a, s)}/result.json")          # the token budget
+        if any(p["kind"] in MC_LABEL for p in pts):
+            need.append(f"{a.seeds_run}/modc/train.jsonl")
     return [p for p in need if not os.path.exists(p)]
 
 
@@ -276,8 +334,9 @@ def main(argv=None):
             raise SystemExit(f"{run} was started with {k} = {state[k]}, now {v}; use another --run")
     if a.bench == "math":           # the evaluated set and the reused adapters must not change under a finished step
         fp = state.setdefault("inputs", {})
-        for f in [f"{run}/data/hv.jsonl"] + [math_adapters(a, p, s)[0] for p in pts for s in a.seeds
-                                             if not math_adapters(a, p, s)[2]]:
+        mcf = [modc_file(a, f"{run}/smoke_data")] if any(p["kind"] in MC_LABEL for p in pts) else []
+        for f in [f"{run}/data/hv.jsonl"] + mcf + [math_adapters(a, p, s)[0] for p in pts for s in a.seeds
+                                                   if not math_adapters(a, p, s)[2]]:
             v = [os.path.getsize(f), int(os.path.getmtime(f))]
             if fp.setdefault(f, v) != v:
                 raise SystemExit(f"{f} changed since this run started (size, mtime {fp[f]} -> {v}); use another --run")
@@ -292,7 +351,13 @@ def main(argv=None):
             for s, d in p["seeds"].items():
                 cur["seeds"].setdefault(s, d)
     order = {"sft": -2.0, "wta1": -1.0, "mcl": 2.0, "loramcl": 2.1}
-    P.sort(key=lambda p: order.get(p["name"], p["share"] if p["share"] is not None else -1))
+    kind_order = {"sft_mc": 3.0, "wta_mc": 3.1, "match": 3.2, "oracle": 3.3}       # after the curve, by kind
+
+    def key(p):
+        if p["kind"] in kind_order:
+            return kind_order[p["kind"]] + p["r_p"] / 1000
+        return order.get(p["name"], p["share"] if p["share"] is not None else -1)
+    P.sort(key=key)
     json.dump({"bench": a.bench, "points": P, "set_file": f"{run}/data/hv.jsonl", "refs": f"{run}/refs/refs.jsonl.gz",
                "data": f"{run}/data", "k": a.k, "R": RANK[a.bench], "K": MODES[a.bench]},
               open(os.path.join(run, "points.json"), "w"), indent=1)

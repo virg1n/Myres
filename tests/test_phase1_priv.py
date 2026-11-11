@@ -17,6 +17,7 @@ import gzip
 import json
 import math
 import os
+import random
 import shutil
 import subprocess
 import sys
@@ -193,6 +194,62 @@ def test_train(base, d, p1):
     print("training: sft / wta / mcl, budget by tokens, refused settings, schedules: ok")
 
 
+def test_train_modc(base, d, p1, se):
+    """oracle / match / the controls on strategy-labelled references (fake modc: strategies 0 and 2 per problem)."""
+    from phase1.train import assign, make_steps
+    from transformers import AutoTokenizer
+    data, mf = f"{p1}/data", f"{se}/modc/train.jsonl"
+    mc = ["--modc_file", mf, "--max_steps", "3"]
+    ck, res = run_train(base, data, f"{d}/mc_oracle", "--variant", "oracle", "--r_s", "4", "--r_p", "0", *mc)
+    assert res["refs"] == "modc" and res["P"] == 8 and ck["cfg"]["refs"] == "modc"     # P = round(16 / 2 refs)
+    sh = res["mode_share"]
+    assert sh[1] == 0 and sh[3] == 0 and abs(sh[0] - 0.5) < 1e-9 and abs(sh[2] - 0.5) < 1e-9, sh
+    _, res = run_train(base, data, f"{d}/mc_match", "--variant", "match", "--r_s", "4", "--r_p", "0", *mc)
+    assert abs(sum(res["mode_share"]) - 1) < 1e-5          # float32 shares
+    _, res = run_train(base, data, f"{d}/mc_wta", "--variant", "wta", "--r_s", "4", "--r_p", "0", *mc)
+    assert res["refs"] == "modc"
+    ck, res = run_train(base, data, f"{d}/mc_sft", "--variant", "sft", "--r_s", "4", "--film", "0", *mc)
+    assert ck["cfg"]["K"] == 1 and res["mode_share"] is None
+    # recipe of a run without labelled references: no modc_file key (directories made before the option resume)
+    assert "modc_file" not in json.load(open(f"{d}/tr_sft/recipe.json"))
+    assert json.load(open(f"{d}/mc_sft/recipe.json"))["modc_file"] == os.path.abspath(mf)
+    # match: the references of one problem always get different modes (eps 0)
+    tok = AutoTokenizer.from_pretrained(base)
+    rows = [json.loads(l) for l in open(mf)]
+    ex = make_steps("sftmodc", rows, [], tok, 5, 0.0, 0, K)[0]
+    assert {e["mode"] for e in ex} == {0, 2} and len(ex) == 10
+    cap = math.ceil(len(ex) / K * 1.25)
+    first = set()
+    for t in range(40):
+        L = torch.rand(K, len(ex), generator=torch.Generator().manual_seed(t))
+        for eps in (0.0, 0.5, 1.0):        # exploration keeps distinct modes inside a problem
+            modes = ptrain.match_assign(ex, L, K, eps, random.Random(t))
+            for g in {e["group"] for e in ex}:
+                ms = [modes[i] for i, e in enumerate(ex) if e["group"] == g]
+                assert len(set(ms)) == len(ms), (t, eps, g, ms)
+            if eps == 0:
+                assert max(np.bincount(modes, minlength=K)) <= cap, "batch capacity of wta1"
+        assert assign("fixed", ex, L, K, 0.5, random.Random(t)) == [e["mode"] for e in ex], "oracle: no eps on solutions"
+        # equal losses (identical modes): the choice is random, not the order of the references (sorted by strategy)
+        tie = ptrain.match_assign(ex, torch.zeros(K, len(ex)), K, 0.0, random.Random(t))
+        first.add(tuple(tie[i] for i, e in enumerate(ex) if e["group"] == ex[0]["group"]))
+    assert len(first) > 3, first
+    # without capacity pressure the matching is the best one: two references, losses that prefer modes 3 and 1
+    two = [dict(p=[1], t=[1], group=0, kind="solve", mode=0, w=1.0), dict(p=[1], t=[1], group=0, kind="solve", mode=2, w=1.0)]
+    L = torch.tensor([[5.0, 5.0], [4.0, 0.0], [5.0, 5.0], [0.0, 4.0]])
+    assert ptrain.match_assign(two, L, K, 0.0, random.Random(0)) == [3, 1]
+    for bad, why in ((["--variant", "oracle"], "needs --modc_file"),
+                     (["--variant", "oracle", "--modc_file", mf, "--K", "2"], "needs --K"),
+                     (["--variant", "mcl", "--modc_file", mf, "--r_s", "0", "--r_p", "4", "--film", "0"], "for math")):
+        try:
+            ptrain.main(["--task", "math", "--base", base, "--data", data, "--out", f"{d}/mc_bad", "--max_steps", "1",
+                         *bad])
+            raise AssertionError(f"accepted: {bad}")
+        except SystemExit as e:
+            assert why in str(e), (bad, str(e))
+    print("training on labelled references: oracle, match, controls, refused settings: ok")
+
+
 def test_refs_nll(base, d, p0, p1, se):
     from phase1 import peval
     peval.main(["refs", "--phase0", p0, "--phase1", p1, "--modc", f"{se}/modc/train.jsonl", "--n_train", "5",
@@ -342,6 +399,28 @@ def test_plan_and_smoke(d, base, p0, p1, sr, se):
     P = json.load(open(f"{d}/plan_mt/points.json"))
     assert [p["name"] for p in P["points"]] == ["sft", "p1", "p6", "p16", "mcl"]
     assert "mt_base" in r.stdout + r.stderr and "eval_mcl_s0" in r.stdout + r.stderr
+    # labelled references: kinds, order after the curve, r_p from the number, notes for the report
+    r = subprocess.run(prun_cmd(f"{d}/plan_mc", p0, p1, sr, se, "--bench", "math", "--plan_only", "--points",
+                                "oracle2,match,sft,sftmc,oracle,wtamc"), env=ENV, capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout + r.stderr
+    P = json.load(open(f"{d}/plan_mc/points.json"))["points"]
+    assert [p["name"] for p in P] == ["sft", "sftmc", "wtamc", "match", "oracle", "oracle2"], [p["name"] for p in P]
+    by = {p["name"]: p for p in P}
+    assert by["oracle2"]["r_p"] == 2 and by["sftmc"]["share"] is None and all(p["note"] for p in P)
+    for bad in ("sftmc2", "match40"):
+        r = subprocess.run(prun_cmd(f"{d}/plan_mc_bad", p0, p1, sr, se, "--bench", "math", "--plan_only", "--points",
+                                    bad), env=ENV, capture_output=True, text=True)
+        assert r.returncode != 0, bad
+    from phase1 import prun
+    a = prun.parse(["--bench", "math", "--run", f"{d}/plan_mc", "--phase1", p1, "--seeds_run", se])
+    pts = {p["name"]: p for p in prun.parse_points("sftmc,wtamc,match,oracle2", "math", 32)}
+    cmd = prun.train_cmd(a, pts["oracle2"], 0, "o", "data", "m")
+    assert cmd[cmd.index("--variant") + 1] == "oracle" and cmd[cmd.index("--r_p") + 1] == "2"
+    assert cmd[cmd.index("--modc_file") + 1] == f"{os.path.abspath(se)}/modc/train.jsonl"
+    cmd = prun.train_cmd(a, pts["wtamc"], 0, "o", "data", "m")
+    assert cmd[cmd.index("--variant") + 1] == "wta" and cmd[cmd.index("--film") + 1] == "1" and "--modc_file" in cmd
+    cmd = prun.train_cmd(a, pts["sftmc"], 0, "o", "data", "m")
+    assert cmd[cmd.index("--variant") + 1] == "sft" and "--modc_file" in cmd
     print("plans: points, reused adapters, refused inputs: ok")
     run = f"{d}/smoke"
     r = subprocess.run(prun_cmd(run, p0, p1, sr, se, "--bench", "math", "--smoke", "--max_tokens", "8"), env=ENV)
@@ -351,6 +430,14 @@ def test_plan_and_smoke(d, base, p0, p1, sr, se):
     assert set(S["rows"]) == {"sft", "p2"} and "p2" in S["delta_vs_sft"] and S["loss"]["val"]["p2"]["win_share"]
     assert "Лосс на эталонах" in rep
     print("math smoke run end to end: ok")
+    run = f"{d}/smoke_mc"
+    r = subprocess.run(prun_cmd(run, p0, p1, sr, se, "--bench", "math", "--smoke", "--max_tokens", "8", "--points",
+                                "sftmc,match,oracle"), env=ENV)
+    assert r.returncode == 0, "smoke run failed, see " + os.path.join(run, "logs")
+    S = json.load(open(f"{run}/summary_priv.json"))
+    assert set(S["rows"]) == {"sft", "sftmc", "wtamc", "match", "oracle"} and "oracle" in S["delta_vs_sft"]
+    assert json.load(open(f"{run}/train/oracle_s0/result.json"))["refs"] == "modc"
+    print("math smoke run on labelled references end to end: ok")
 
 
 def main():
@@ -360,6 +447,7 @@ def main():
         test_model(base, d)
         p0, p1, sr, se = fake_phase(d, base)
         test_train(base, d, p1)
+        test_train_modc(base, d, p1, se)
         test_refs_nll(base, d, p0, p1, se)
         test_mt(d)
         test_plan_and_smoke(d, base, p0, p1, sr, se)
