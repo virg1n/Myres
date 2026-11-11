@@ -407,6 +407,10 @@ def test_plan_and_smoke(d, base, p0, p1, sr, se):
     assert [p["name"] for p in P] == ["sft", "sftmc", "wtamc", "match", "oracle", "oracle2"], [p["name"] for p in P]
     by = {p["name"]: p for p in P}
     assert by["oracle2"]["r_p"] == 2 and by["sftmc"]["share"] is None and all(p["note"] for p in P)
+    # no room for one exported checkpoint under the quota: refused before any job, the largest directories named
+    r = subprocess.run(prun_cmd(f"{d}/plan_full", p0, p1, sr, se, "--bench", "math", "--plan_only", "--disk_gb", "3"),
+                       env=ENV, capture_output=True, text=True)
+    assert r.returncode != 0 and "Free space first" in r.stdout + r.stderr, r.stdout + r.stderr
     for bad in ("sftmc2", "match40"):
         r = subprocess.run(prun_cmd(f"{d}/plan_mc_bad", p0, p1, sr, se, "--bench", "math", "--plan_only", "--points",
                                     bad), env=ENV, capture_output=True, text=True)

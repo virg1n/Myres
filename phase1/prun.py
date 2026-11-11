@@ -53,6 +53,23 @@ RANK = {"math": 32, "mt": 16}
 MODES = {"math": 4, "mt": 3}
 
 
+EXPORT_GB = 4.0        # one exported mode (3.5 GB) with margin, as peval.export_slot
+
+
+def tree_gb(root):
+    """Size of the files under root (symbolic links not followed, as peval.disk_used_gb)."""
+    if os.path.isfile(root):
+        return os.path.getsize(root) / 1e9
+    total = 0
+    for d, _, files in os.walk(root):
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(d, f))
+            except OSError:
+                pass
+    return total / 1e9
+
+
 def wta1_dir(a, s):
     return f"{a.phase1}/train/wta1" if s == 0 else f"{a.seeds_run}/train/wta1_s{s}"
 
@@ -368,6 +385,15 @@ def main(argv=None):
     log(f"{a.bench}: {len(J)} jobs, simulated {mk:.1f} h left on {len(gpus)} GPUs (budget {a.hours} h, hard limit "
         f"{a.max_hours} h); seeds {a.seeds}; points {[p['name'] for p in pts]}; free disk "
         f"{shutil.disk_usage(run).free / 1e9:.0f} GB (as the OS reports it)")
+    if a.bench == "math" and any(j.name.startswith("gen_") and not is_done(j.out) for j in J):
+        # an evaluation exports a 3.5 GB checkpoint under the quota: refuse now rather than wait hours for room
+        used = tree_gb(a.disk_root)
+        log(f"disk: {used:.1f} GB under {a.disk_root} (quota --disk_gb {a.disk_gb:g})")
+        if used + EXPORT_GB > a.disk_gb:
+            top = sorted(((tree_gb(os.path.join(a.disk_root, x)), x) for x in os.listdir(a.disk_root)), reverse=True)
+            raise SystemExit(f"{a.disk_root} holds {used:.1f} GB: an evaluation needs {EXPORT_GB:g} GB more under "
+                             f"--disk_gb {a.disk_gb:g}. Free space first; largest: "
+                             + ", ".join(f"{x} {g:.1f} GB" for g, x in top[:8]))
     if a.plan_only:
         for j in J:
             log(f"  {j.name}: est {j.est:.2f} h, deps {j.deps}")

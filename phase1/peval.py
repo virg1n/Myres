@@ -144,7 +144,7 @@ class export_slot:
     --disk_gb (a quota smaller than the free space the OS reports); the lock serializes the check and the write, so two
     jobs never both see the same room. Without fcntl (Windows) only the size check."""
 
-    def __init__(self, root, limit_gb, need_gb, timeout_h=2.0):
+    def __init__(self, root, limit_gb, need_gb, timeout_h=12.0):     # other evaluations free their export within hours
         self.root, self.limit, self.need, self.timeout = root, limit_gb, need_gb, timeout_h
 
     def __enter__(self):
